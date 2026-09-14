@@ -1985,17 +1985,31 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   // ---------- Aggiornamento in UNA sola chiamata per tutte le squadre ----------
   // Evita di saturare il limite richieste/minuto: una sola richiesta HTTP,
   // Claude fa internamente più ricerche web (una serie per squadra) nello stesso turno.
+  // Stagione Serie A corrente: da luglio in poi è annoYYYY/YY+1, prima è annoYYYY-1/YY.
+  function currentSerieASeason(){
+    const now = new Date();
+    const y = now.getFullYear();
+    const startYear = now.getMonth() >= 6 ? y : y - 1; // getMonth() 6 = luglio
+    return `${startYear}/${String(startYear+1).slice(2)}`;
+  }
+
   function buildFullPrompt(map, matchday){
     const teamsText = Array.from(map.entries()).map(([team, players])=>{
       const names = players.map(p=>`  - ${p.name} (${ROLE_LABEL[p.role]})`).join('\n');
       return `### ${team}\n${names}`;
     }).join('\n\n');
 
+    const today = new Date().toLocaleDateString('it-IT', { day:'2-digit', month:'long', year:'numeric' });
+    const season = currentSerieASeason();
+    const prevSeasonStart = parseInt(season,10) - 1;
+    const prevSeason = `${prevSeasonStart}/${String(prevSeasonStart+1).slice(2)}`;
+
     const matchdayLine = matchday
-      ? `\nATTENZIONE: fai riferimento ESATTAMENTE alla giornata ${matchday} di Serie A (quella corrente/di riferimento indicata da me), non ad altre giornate già giocate o future. Se una squadra ha già giocato questa giornata, usa comunque i dati di quella partita specifica.\n`
+      ? `\nATTENZIONE: fai riferimento ESATTAMENTE alla giornata ${matchday} di Serie A ${season} (quella corrente/di riferimento indicata da me), non ad altre giornate già giocate o future. Se una squadra ha già giocato questa giornata, usa comunque i dati di quella partita specifica.\n`
       : '';
 
-    return `Cerca sul web informazioni aggiornate e recenti su CIASCUNA delle seguenti squadre di Serie A, in vista della prossima giornata di campionato.${matchdayLine} Fai una ricerca separata per ogni squadra elencata, non saltarne nessuna. Dai priorità a queste pagine specifiche (più affidabili di una ricerca generica perché aggiornate quotidianamente e strutturate proprio per il fantacalcio): fantacalcio.it/probabili-formazioni/serie-a (titolari/ballottaggi ufficiosi), fantacalcio.it/quotazioni-fantacalcio (quotazioni e ruoli), fantacalcio.it/voti-fantacalcio (storico voti reali, utile per "recent_ratings" più sotto). Integra con gazzetta.it, corrieredellosport.it, sky sport per infortuni/squalifiche/conferenze stampa, e con sofascore/fbref/understat per statistiche avanzate (xG, xGA, tiri). Usa i siti ufficiali dei club solo per conferme dirette.
+    return `Oggi è ${today}. La stagione di Serie A in corso è la ${season}. Cerca sul web informazioni aggiornate e recenti su CIASCUNA delle seguenti squadre di Serie A, in vista della prossima giornata di campionato.${matchdayLine}
+ATTENZIONE STAGIONE: usa SOLO dati della stagione ${season}. Molte pagine indicizzate online (calendari, "giornata X", voti, formazioni) si riferiscono alla stagione passata ${prevSeason}, già conclusa e quindi più "stabile" nei risultati di ricerca — NON usarle per nessun motivo, anche se sembrano pertinenti. Prima di usare qualsiasi dato (avversario, data partita, voto, xG), verifica esplicitamente che la pagina/fonte riporti l'anno o la stagione ${season} e non ${prevSeason} o altre stagioni precedenti. Fai una ricerca separata per ogni squadra elencata, non saltarne nessuna. Dai priorità a queste pagine specifiche (più affidabili di una ricerca generica perché aggiornate quotidianamente e strutturate proprio per il fantacalcio): fantacalcio.it/probabili-formazioni/serie-a (titolari/ballottaggi ufficiosi), fantacalcio.it/quotazioni-fantacalcio (quotazioni e ruoli), fantacalcio.it/voti-fantacalcio (storico voti reali, utile per "recent_ratings" più sotto). Integra con gazzetta.it, corrieredellosport.it, sky sport per infortuni/squalifiche/conferenze stampa, e con sofascore/fbref/understat per statistiche avanzate (xG, xGA, tiri). Usa i siti ufficiali dei club solo per conferme dirette.
 
 Per ogni squadra individua: chi gioca titolare tra i giocatori elencati, i ballottaggi aperti (con probabilità), gli infortunati/squalificati, chi calcia i rigori/punizioni, la forma recente, eventuali turnover (coppe europee/infrasettimanale), il prossimo avversario.
 
@@ -2064,7 +2078,11 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   // ---------- Aggiornamento xG/xGA di squadra (usato per la difficoltà partita) ----------
   function buildTeamXgPrompt(){
     const teamList = Object.keys(TEAM_XG_STATS).sort().join(', ');
-    return `Cerca sul web la tabella xG (gol attesi) e xGA (gol attesi subiti) aggiornata di questa stagione di Serie A, per TUTTE le seguenti 20 squadre: ${teamList}. Fonti preferite, in ordine: oddalerts.com/xg/serie-a, sofascore.com (sezione statistiche/xG del torneo), fbref.com, understat.com. Prendi il totale xG fatto e xGA (xG concesso) di ciascuna squadra nelle partite giocate finora in campionato (NON in coppe), il numero di partite di campionato giocate, e SE disponibile anche lo split separato xG/xGA/partite giocate SOLO IN CASA e SOLO IN TRASFERTA (spesso su fbref o sofascore c'è un filtro "Home/Away"); se non trovi lo split lascia quei campi a null, non inventare numeri.
+    const today = new Date().toLocaleDateString('it-IT', { day:'2-digit', month:'long', year:'numeric' });
+    const season = currentSerieASeason();
+    const prevSeasonStart = parseInt(season,10) - 1;
+    const prevSeason = `${prevSeasonStart}/${String(prevSeasonStart+1).slice(2)}`;
+    return `Oggi è ${today}. Cerca sul web la tabella xG (gol attesi) e xGA (gol attesi subiti) della stagione di Serie A ${season} (quella IN CORSO, non ancora conclusa), per TUTTE le seguenti 20 squadre: ${teamList}. ATTENZIONE: molte tabelle xG indicizzate online si riferiscono alla stagione passata ${prevSeason}, già conclusa — NON usarle, verifica sempre che la fonte riporti dati della stagione ${season} prima di prenderli per buoni. Fonti preferite, in ordine: oddalerts.com/xg/serie-a, sofascore.com (sezione statistiche/xG del torneo), fbref.com, understat.com. Prendi il totale xG fatto e xGA (xG concesso) di ciascuna squadra nelle partite giocate finora in campionato (NON in coppe), il numero di partite di campionato giocate, e SE disponibile anche lo split separato xG/xGA/partite giocate SOLO IN CASA e SOLO IN TRASFERTA (spesso su fbref o sofascore c'è un filtro "Home/Away"); se non trovi lo split lascia quei campi a null, non inventare numeri.
 
 Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown, senza backtick, in questo identico formato — un elemento per OGNI squadra elencata sopra, usando ESATTAMENTE questi nomi squadra:
 {
