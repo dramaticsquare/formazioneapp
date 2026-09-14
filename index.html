@@ -1833,6 +1833,52 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     return text.replace(/```json/gi,'').replace(/```/g,'').trim();
   }
 
+  // I modelli a volte mettono un vero "a capo" (o tab, o altri caratteri di controllo)
+  // dentro un campo testo invece di scriverlo come \n escapato: questo rompe JSON.parse
+  // con "Bad control character in string literal". Qui li troviamo (solo quando siamo
+  // DENTRO una stringa JSON, rispettando gli escape) e li ri-escapiamo correttamente.
+  function sanitizeJsonControlChars(str){
+    let out = '';
+    let inString = false;
+    let escaping = false;
+    for(let i=0; i<str.length; i++){
+      const ch = str[i];
+      const code = str.charCodeAt(i);
+      if(inString){
+        if(escaping){ out += ch; escaping = false; continue; }
+        if(ch === '\\'){ out += ch; escaping = true; continue; }
+        if(ch === '"'){ inString = false; out += ch; continue; }
+        if(code < 0x20){
+          if(ch === '\n') out += '\\n';
+          else if(ch === '\r') out += '\\r';
+          else if(ch === '\t') out += '\\t';
+          else out += '\\u' + code.toString(16).padStart(4,'0');
+          continue;
+        }
+        out += ch;
+      } else {
+        if(ch === '"') inString = true;
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  // Prova a fare il parse in modo robusto: fences → sanitize → parse diretto,
+  // e se fallisce isola il blocco {...} più esterno e riprova.
+  function parseAiJson(text){
+    const clean = sanitizeJsonControlChars(stripJsonFences(text));
+    try{
+      return JSON.parse(clean);
+    }catch(e){
+      const match = clean.match(/\{[\s\S]*\}/);
+      if(match){
+        try{ return JSON.parse(match[0]); }catch(e2){ /* cade nel throw sotto */ }
+      }
+      throw new Error('JSON non valido: ' + e.message);
+    }
+  }
+
   // ---------- Chiamata AI: proxy serverless (Vercel) → Gemini ----------
   // Nessuna API key nel browser: la chiave Gemini resta solo lato server (env var GEMINI_API_KEY).
   function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
@@ -1887,16 +1933,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       .map(block=>block.text)
       .join('\n');
     if(!text.trim()) throw new Error('risposta vuota');
-    const clean = stripJsonFences(text);
-    let parsed;
-    try{
-      parsed = JSON.parse(clean);
-    }catch(e){
-      const match = clean.match(/\{[\s\S]*\}/);
-      if(match) parsed = JSON.parse(match[0]);
-      else throw new Error('JSON non valido');
-    }
-    return parsed;
+    return parseAiJson(text);
   }
 
   function applyTeamUpdate(team, players, result){
@@ -2051,16 +2088,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       .map(block=>block.text)
       .join('\n');
     if(!text.trim()) throw new Error('risposta vuota');
-    const clean = stripJsonFences(text);
-    let parsed;
-    try{
-      parsed = JSON.parse(clean);
-    }catch(e){
-      const match = clean.match(/\{[\s\S]*\}/);
-      if(match) parsed = JSON.parse(match[0]);
-      else throw new Error('JSON non valido');
-    }
-    return parsed;
+    return parseAiJson(text);
   }
 
   function applyTeamXgUpdate(result){
@@ -2115,16 +2143,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       .map(block=>block.text)
       .join('\n');
     if(!text.trim()) throw new Error('risposta vuota');
-    const clean = stripJsonFences(text);
-    let parsed;
-    try{
-      parsed = JSON.parse(clean);
-    }catch(e){
-      const match = clean.match(/\{[\s\S]*\}/);
-      if(match) parsed = JSON.parse(match[0]);
-      else throw new Error('JSON non valido');
-    }
-    return parsed;
+    return parseAiJson(text);
   }
 
   function applyFullUpdate(map, result){
