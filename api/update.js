@@ -29,7 +29,12 @@ module.exports = async (req, res) => {
   // Puoi cambiare modello qui senza toccare il frontend.
   // gemini-2.5-flash: buon compromesso costo/qualità/velocità per questo caso d'uso.
   const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-  const maxOutputTokens = Math.max(256, Math.min(Number(max_tokens) || 4000, 8192));
+  // Il frontend manda un max_tokens pensato per Anthropic (fino a 8000): con Gemini 2.5,
+  // che è un modello "thinking", parte del budget di output viene consumata dal
+  // ragionamento interno prima ancora di scrivere la risposta finale — con rose ampie
+  // (10+ squadre) il JSON risultava troncato. Alziamo il tetto reale e limitiamo il
+  // budget di pensiero, lasciando più spazio alla risposta vera e propria.
+  const maxOutputTokens = Math.max(4096, Math.min((Number(max_tokens) || 4000) * 3, 32768));
 
   try {
     const upstream = await fetch(
@@ -43,7 +48,11 @@ module.exports = async (req, res) => {
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           tools: [{ google_search: {} }],
-          generationConfig: { maxOutputTokens, temperature: 0.4 }
+          generationConfig: {
+            maxOutputTokens,
+            temperature: 0.4,
+            thinkingConfig: { thinkingBudget: 1024 }
+          }
         })
       }
     );
@@ -61,11 +70,18 @@ module.exports = async (req, res) => {
     const candidate = data && data.candidates && data.candidates[0];
     const parts = (candidate && candidate.content && candidate.content.parts) || [];
     const text = parts.map(p => p.text || '').join('\n');
+    const finishReason = candidate && candidate.finishReason;
 
     if (!text.trim()) {
       // Risposta bloccata da safety filter, MAX_TOKENS raggiunto senza testo, ecc.
-      const reason = candidate && candidate.finishReason;
-      res.status(502).json({ error: `Risposta vuota da Gemini${reason ? ' (finishReason: ' + reason + ')' : ''}` });
+      res.status(502).json({ error: `Risposta vuota da Gemini${finishReason ? ' (finishReason: ' + finishReason + ')' : ''}` });
+      return;
+    }
+
+    if (finishReason === 'MAX_TOKENS') {
+      // Testo presente ma troncato: il JSON quasi certamente non si chiude. Meglio
+      // segnalarlo chiaramente ora che scoprirlo dopo da un errore di parsing generico.
+      res.status(502).json({ error: 'Risposta troncata da Gemini (finishReason: MAX_TOKENS) — la rosa/squadre da valutare è troppo ampia per il budget di token attuale. Riprova, o dividi l\'aggiornamento in più gruppi di squadre.' });
       return;
     }
 
