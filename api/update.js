@@ -36,7 +36,14 @@ module.exports = async (req, res) => {
   // budget di pensiero, lasciando più spazio alla risposta vera e propria.
   const maxOutputTokens = Math.max(4096, Math.min((Number(max_tokens) || 4000) * 3, 32768));
 
-  try {
+  // Budget di "pensiero" per l'orchestrazione delle ricerche: con richieste grounded
+  // che devono cercare e aggregare molte entità (es. xG di 20 squadre), 1024 è spesso
+  // troppo stretto e il modello può terminare con finishReason STOP senza mai scrivere
+  // il testo finale (bug noto di Gemini con google_search su prompt di ricerca "larghi",
+  // vedi forum Google AI / googleapis/python-genai#1289). Alziamo un po' il tetto.
+  const thinkingBudget = Math.min(4096, Math.max(1024, Math.round(maxOutputTokens * 0.4)));
+
+  async function callGeminiOnce() {
     const upstream = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
       {
@@ -51,19 +58,20 @@ module.exports = async (req, res) => {
           generationConfig: {
             maxOutputTokens,
             temperature: 0.4,
-            thinkingConfig: { thinkingBudget: 1024 }
+            thinkingConfig: { thinkingBudget }
           }
         })
       }
     );
 
     const retryAfter = upstream.headers.get('retry-after');
-    if (retryAfter) res.setHeader('Retry-After', retryAfter);
 
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
-      res.status(upstream.status).json({ error: `Gemini HTTP ${upstream.status}: ${errText.slice(0, 400)}` });
-      return;
+      const err = new Error(`Gemini HTTP ${upstream.status}: ${errText.slice(0, 400)}`);
+      err.status = upstream.status;
+      err.retryAfter = retryAfter;
+      throw err;
     }
 
     const data = await upstream.json();
@@ -73,19 +81,53 @@ module.exports = async (req, res) => {
     const finishReason = candidate && candidate.finishReason;
 
     if (!text.trim()) {
-      // Risposta bloccata da safety filter, MAX_TOKENS raggiunto senza testo, ecc.
-      res.status(502).json({ error: `Risposta vuota da Gemini${finishReason ? ' (finishReason: ' + finishReason + ')' : ''}` });
-      return;
+      // Risposta bloccata da safety filter, o - il caso più comune - Gemini che con
+      // il tool di ricerca "si perde" nell'orchestrazione delle query e chiude con
+      // STOP senza mai produrre testo. È quasi sempre transitorio: chi chiama questa
+      // funzione ritenta.
+      const err = new Error(`Risposta vuota da Gemini${finishReason ? ' (finishReason: ' + finishReason + ')' : ''}`);
+      err.emptyResponse = true;
+      err.retryAfter = retryAfter;
+      throw err;
     }
 
     if (finishReason === 'MAX_TOKENS') {
-      // Testo presente ma troncato: il JSON quasi certamente non si chiude. Meglio
-      // segnalarlo chiaramente ora che scoprirlo dopo da un errore di parsing generico.
-      res.status(502).json({ error: 'Risposta troncata da Gemini (finishReason: MAX_TOKENS) — la rosa/squadre da valutare è troppo ampia per il budget di token attuale. Riprova, o dividi l\'aggiornamento in più gruppi di squadre.' });
-      return;
+      // Testo presente ma troncato: il JSON quasi certamente non si chiude. Un retry
+      // non aiuta qui (è un problema di budget, non di flakiness), meglio segnalarlo
+      // subito invece di scoprirlo da un errore di parsing generico più avanti.
+      const err = new Error('Risposta troncata da Gemini (finishReason: MAX_TOKENS) — la rosa/squadre da valutare è troppo ampia per il budget di token attuale. Riprova, o dividi l\'aggiornamento in più gruppi di squadre.');
+      err.status = 502;
+      err.retryAfter = retryAfter;
+      throw err;
     }
 
-    res.status(200).json({ content: [{ type: 'text', text }] });
+    return { text, retryAfter };
+  }
+
+  const MAX_ATTEMPTS = 2; // 1 tentativo + 1 retry interno, solo per risposte vuote
+  try {
+    let lastErr;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const { text, retryAfter } = await callGeminiOnce();
+        if (retryAfter) res.setHeader('Retry-After', retryAfter);
+        res.status(200).json({ content: [{ type: 'text', text }] });
+        return;
+      } catch (err) {
+        lastErr = err;
+        // Ritenta subito (nessun backoff: non è rate-limit) solo sul caso "risposta
+        // vuota", che è tipicamente intermittente. Per tutti gli altri errori (4xx/5xx
+        // espliciti, MAX_TOKENS) esce subito: un retry non cambierebbe l'esito.
+        if (err.emptyResponse && attempt < MAX_ATTEMPTS) continue;
+        break;
+      }
+    }
+    if (lastErr.retryAfter) res.setHeader('Retry-After', lastErr.retryAfter);
+    // Se dopo il retry interno è ancora vuota, segnaliamo 503: il frontend la tratta
+    // già come transitoria e la ritenta da solo con backoff (a differenza del 502
+    // usato prima, che il frontend non ritentava affatto).
+    const status = lastErr.status || (lastErr.emptyResponse ? 503 : 502);
+    res.status(status).json({ error: lastErr.message });
   } catch (err) {
     res.status(500).json({ error: String(err && err.message || err) });
   }
