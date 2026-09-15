@@ -2076,15 +2076,30 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   }
 
   // ---------- Aggiornamento xG/xGA di squadra (usato per la difficoltà partita) ----------
-  function buildTeamXgPrompt(){
-    const teamList = Object.keys(TEAM_XG_STATS).sort().join(', ');
+  // Chiedere in un'unica chiamata di cercare e aggregare xG/xGA per tutte e 20 le
+  // squadre è troppo per un modello con ricerca grounded: tende a fermarsi prima di
+  // aver completato tutte le ricerche necessarie, restituendo risposte vuote o
+  // parziali (es. dati per 1 sola squadra su 20) pur segnalando "successo". Dividiamo
+  // quindi la richiesta in più batch più piccoli, interrogati in parallelo: ogni
+  // batch ha molte meno ricerche da fare e quindi molte più probabilità di
+  // completarle tutte prima di rispondere.
+  const TEAM_XG_BATCH_SIZE = 6;
+
+  function chunkArray(arr, size){
+    const out = [];
+    for(let i=0; i<arr.length; i+=size) out.push(arr.slice(i, i+size));
+    return out;
+  }
+
+  function buildTeamXgPrompt(teamNames){
+    const teamList = teamNames.slice().sort().join(', ');
     const today = new Date().toLocaleDateString('it-IT', { day:'2-digit', month:'long', year:'numeric' });
     const season = currentSerieASeason();
     const prevSeasonStart = parseInt(season,10) - 1;
     const prevSeason = `${prevSeasonStart}/${String(prevSeasonStart+1).slice(2)}`;
-    return `Oggi è ${today}. Cerca sul web la tabella xG (gol attesi) e xGA (gol attesi subiti) della stagione di Serie A ${season} (quella IN CORSO, non ancora conclusa), per TUTTE le seguenti 20 squadre: ${teamList}. ATTENZIONE: molte tabelle xG indicizzate online si riferiscono alla stagione passata ${prevSeason}, già conclusa — NON usarle, verifica sempre che la fonte riporti dati della stagione ${season} prima di prenderli per buoni. Fonti preferite, in ordine: oddalerts.com/xg/serie-a, sofascore.com (sezione statistiche/xG del torneo), fbref.com, understat.com. Prendi il totale xG fatto e xGA (xG concesso) di ciascuna squadra nelle partite giocate finora in campionato (NON in coppe), il numero di partite di campionato giocate, e SE disponibile anche lo split separato xG/xGA/partite giocate SOLO IN CASA e SOLO IN TRASFERTA (spesso su fbref o sofascore c'è un filtro "Home/Away"); se non trovi lo split lascia quei campi a null, non inventare numeri.
+    return `Oggi è ${today}. Cerca sul web la tabella xG (gol attesi) e xGA (gol attesi subiti) della stagione di Serie A ${season} (quella IN CORSO, non ancora conclusa), per TUTTE le seguenti squadre: ${teamList}. ATTENZIONE: molte tabelle xG indicizzate online si riferiscono alla stagione passata ${prevSeason}, già conclusa — NON usarle, verifica sempre che la fonte riporti dati della stagione ${season} prima di prenderli per buoni. Fonti preferite, in ordine: oddalerts.com/xg/serie-a, sofascore.com (sezione statistiche/xG del torneo), fbref.com, understat.com. Prendi il totale xG fatto e xGA (xG concesso) di ciascuna squadra nelle partite giocate finora in campionato (NON in coppe), il numero di partite di campionato giocate, e SE disponibile anche lo split separato xG/xGA/partite giocate SOLO IN CASA e SOLO IN TRASFERTA (spesso su fbref o sofascore c'è un filtro "Home/Away"); se non trovi lo split lascia quei campi a null, non inventare numeri.
 
-Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown, senza backtick, in questo identico formato — un elemento per OGNI squadra elencata sopra, usando ESATTAMENTE questi nomi squadra:
+Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown, senza backtick, in questo identico formato — un elemento per OGNI squadra elencata sopra (${teamNames.length} squadre, non fermarti prima), usando ESATTAMENTE questi nomi squadra:
 {
   "teams": [
     { "team": "nome esatto tra quelli elencati sopra", "g": numero partite di campionato giocate, "xg": numero xG totale fatto, "xga": numero xGA totale subito,
@@ -2094,11 +2109,11 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
 }`;
   }
 
-  async function callTeamXgUpdate(onRetry){
+  async function callTeamXgUpdateBatch(teamNames, onRetry){
     const data = await anthropicMessages({
       model: AI_MODEL,
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: buildTeamXgPrompt() }],
+      max_tokens: 800 + teamNames.length*250,
+      messages: [{ role: 'user', content: buildTeamXgPrompt(teamNames) }],
       tools: [{ type: 'web_search_20250305', name: 'web_search' }]
     }, onRetry);
     const text = (data.content||[])
@@ -2107,6 +2122,27 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       .join('\n');
     if(!text.trim()) throw new Error('risposta vuota');
     return parseAiJson(text);
+  }
+
+  // Interroga tutte le 20 squadre suddivise in batch paralleli e unisce i risultati.
+  // Un batch fallito (es. ancora vuoto dopo i retry) non fa fallire gli altri: si
+  // perdono solo le squadre di quel batch, che restano con i dati xG già presenti.
+  async function callTeamXgUpdate(onRetry){
+    const allTeams = Object.keys(TEAM_XG_STATS).sort();
+    const batches = chunkArray(allTeams, TEAM_XG_BATCH_SIZE);
+    const outcomes = await Promise.all(
+      batches.map(batchTeams => callTeamXgUpdateBatch(batchTeams, onRetry)
+        .then(r => ({ ok:true, teams: batchTeams, data:r }))
+        .catch(e => ({ ok:false, teams: batchTeams, error:e })))
+    );
+    const teams = [];
+    const failedBatches = [];
+    outcomes.forEach(o=>{
+      if(o.ok) teams.push(...(o.data.teams||[]));
+      else failedBatches.push(o.teams);
+    });
+    if(teams.length === 0) throw new Error('risposta vuota (tutti i batch falliti)');
+    return { teams, failedBatches };
   }
 
   function applyTeamXgUpdate(result){
@@ -2146,7 +2182,8 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     });
     teamXgLastUpdate = new Date().toISOString();
     recomputeTeamRatings();
-    return { matched, total: Object.keys(TEAM_XG_STATS).length, unmatched, withSplit };
+    const failedBatchTeams = (result.failedBatches||[]).flat();
+    return { matched, total: Object.keys(TEAM_XG_STATS).length, unmatched, withSplit, failedBatchTeams };
   }
 
   async function callFullUpdate(map, matchday, onRetry){
@@ -2195,7 +2232,8 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     const teams = Array.from(map.keys());
     const matchday = parseInt($('#matchdayInput').value, 10) || null;
     logStatus(`Cerco info per ${teams.length} squadre in un'unica richiesta (${teams.join(', ')})…`);
-    logStatus(`In parallelo aggiorno anche xG/xGA di tutte le 20 squadre (per la difficoltà partita)…`);
+    const xgBatchCount = Math.ceil(Object.keys(TEAM_XG_STATS).length / TEAM_XG_BATCH_SIZE);
+    logStatus(`In parallelo aggiorno anche xG/xGA di tutte le 20 squadre, in ${xgBatchCount} gruppi da ${TEAM_XG_BATCH_SIZE} (per la difficoltà partita)…`);
     try{
       const [result, xgOutcome] = await Promise.all([
         callFullUpdate(map, matchday, (attempt, waitSec)=>{
@@ -2206,10 +2244,11 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
         }).then(r=>({ ok:true, data:r })).catch(e=>({ ok:false, error:e }))
       ]);
       if(xgOutcome.ok){
-        const { matched, total, unmatched, withSplit } = applyTeamXgUpdate(xgOutcome.data);
+        const { matched, total, unmatched, withSplit, failedBatchTeams } = applyTeamXgUpdate(xgOutcome.data);
         saveTeamXgStats();
         logStatus(`✓ Forza squadre (xG/xGA): ${matched}/${total} squadre aggiornate${withSplit ? `, ${withSplit} con split casa/trasferta` : ''}.`, matched<total ? 'err' : 'ok');
         if(unmatched.length) logStatus(`  ⚠️ squadre non riconosciute nella risposta xG: ${unmatched.join(', ')}`, 'err');
+        if(failedBatchTeams.length) logStatus(`  ⚠️ gruppo di ricerca fallito per: ${failedBatchTeams.join(', ')} (dati xG precedenti mantenuti)`, 'err');
       } else {
         logStatus(`✗ Aggiornamento xG squadre fallito (${xgOutcome.error.message}) — uso i dati xG già presenti.`, 'err');
       }
