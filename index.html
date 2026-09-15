@@ -2124,25 +2124,47 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     return parseAiJson(text);
   }
 
-  // Interroga tutte le 20 squadre suddivise in batch paralleli e unisce i risultati.
-  // Un batch fallito (es. ancora vuoto dopo i retry) non fa fallire gli altri: si
-  // perdono solo le squadre di quel batch, che restano con i dati xG già presenti.
-  async function callTeamXgUpdate(onRetry){
-    const allTeams = Object.keys(TEAM_XG_STATS).sort();
-    const batches = chunkArray(allTeams, TEAM_XG_BATCH_SIZE);
+  // Esegue un giro di richieste xG per l'elenco di squadre dato, suddiviso in batch
+  // di 'size', in parallelo. Ritorna solo le squadre effettivamente restituite: un
+  // batch che fallisce o che risponde con meno squadre di quelle richieste (il
+  // problema di fondo: Gemini a volte si ferma a metà pur restituendo JSON valido)
+  // semplicemente non contribuisce quelle squadre al risultato, senza far fallire
+  // il resto.
+  async function fetchXgRound(teamNames, size, onRetry){
+    const batches = chunkArray(teamNames, size);
     const outcomes = await Promise.all(
       batches.map(batchTeams => callTeamXgUpdateBatch(batchTeams, onRetry)
-        .then(r => ({ ok:true, teams: batchTeams, data:r }))
-        .catch(e => ({ ok:false, teams: batchTeams, error:e })))
+        .then(r => (r.teams||[]))
+        .catch(() => []))
     );
-    const teams = [];
-    const failedBatches = [];
-    outcomes.forEach(o=>{
-      if(o.ok) teams.push(...(o.data.teams||[]));
-      else failedBatches.push(o.teams);
-    });
+    return outcomes.flat();
+  }
+
+  // Quali squadre, tra quelle richieste, NON sono presenti tra i risultati ottenuti
+  // finora (per nome risolto, non per stringa esatta: l'AI a volte scrive il nome
+  // squadra leggermente diverso da quello canonico).
+  function findMissingTeams(wanted, teamsResult){
+    const covered = new Set(teamsResult.map(t=>resolveTeamKey(t.team)).filter(Boolean));
+    return wanted.filter(t=>!covered.has(t));
+  }
+
+  // Interroga tutte le 20 squadre suddivise in batch paralleli e unisce i risultati.
+  // Un primo giro con batch da 6 copre la maggior parte dei casi; le squadre rimaste
+  // scoperte (batch falliti, o batch riusciti ma con risposta incompleta) vengono
+  // richieste una seconda volta in gruppi più piccoli, dove la probabilità di
+  // completare tutte le ricerche è più alta. Chi resta scoperto anche dopo il
+  // secondo giro mantiene i dati xG già presenti (nessun dato inventato).
+  async function callTeamXgUpdate(onRetry){
+    const allTeams = Object.keys(TEAM_XG_STATS).sort();
+    let teams = await fetchXgRound(allTeams, TEAM_XG_BATCH_SIZE, onRetry);
+    let missing = findMissingTeams(allTeams, teams);
+    if(missing.length){
+      const retryTeams = await fetchXgRound(missing, 2, onRetry);
+      teams = teams.concat(retryTeams);
+      missing = findMissingTeams(allTeams, teams);
+    }
     if(teams.length === 0) throw new Error('risposta vuota (tutti i batch falliti)');
-    return { teams, failedBatches };
+    return { teams, stillMissing: missing };
   }
 
   function applyTeamXgUpdate(result){
@@ -2182,8 +2204,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     });
     teamXgLastUpdate = new Date().toISOString();
     recomputeTeamRatings();
-    const failedBatchTeams = (result.failedBatches||[]).flat();
-    return { matched, total: Object.keys(TEAM_XG_STATS).length, unmatched, withSplit, failedBatchTeams };
+    return { matched, total: Object.keys(TEAM_XG_STATS).length, unmatched, withSplit, stillMissing: result.stillMissing||[] };
   }
 
   async function callFullUpdate(map, matchday, onRetry){
@@ -2244,11 +2265,11 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
         }).then(r=>({ ok:true, data:r })).catch(e=>({ ok:false, error:e }))
       ]);
       if(xgOutcome.ok){
-        const { matched, total, unmatched, withSplit, failedBatchTeams } = applyTeamXgUpdate(xgOutcome.data);
+        const { matched, total, unmatched, withSplit, stillMissing } = applyTeamXgUpdate(xgOutcome.data);
         saveTeamXgStats();
         logStatus(`✓ Forza squadre (xG/xGA): ${matched}/${total} squadre aggiornate${withSplit ? `, ${withSplit} con split casa/trasferta` : ''}.`, matched<total ? 'err' : 'ok');
         if(unmatched.length) logStatus(`  ⚠️ squadre non riconosciute nella risposta xG: ${unmatched.join(', ')}`, 'err');
-        if(failedBatchTeams.length) logStatus(`  ⚠️ gruppo di ricerca fallito per: ${failedBatchTeams.join(', ')} (dati xG precedenti mantenuti)`, 'err');
+        if(stillMissing.length) logStatus(`  ⚠️ nessun dato trovato (dopo 2 tentativi) per: ${stillMissing.join(', ')} — dati xG precedenti mantenuti`, 'err');
       } else {
         logStatus(`✗ Aggiornamento xG squadre fallito (${xgOutcome.error.message}) — uso i dati xG già presenti.`, 'err');
       }
