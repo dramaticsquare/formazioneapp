@@ -712,7 +712,7 @@
     <div id="matchDifficultyBox" class="weights-box">
       <div class="weights-title">Difficoltà partita: calcolata, non a occhio</div>
       <div style="font-size:11px;color:#8C9A90;">
-        La difficoltà di ogni partita si calcola dai GOL ATTESI (xG/xGA), non dai gol reali: lo xG riflette la qualità delle occasioni create/concesse tiro per tiro, quindi è meno soggetto a rimbalzi fortunati o un portiere in giornata no rispetto al risultato secco. Differenziato per ruolo (attacco avversario per portieri/difensori, difesa avversaria per centrocampisti/attaccanti) e stabilizzato mescolando i gol REALI della Serie A 2025/26 (6 partite equivalenti di storico) alle prime giornate di quest'anno — sia per il rendimento generale che per lo split CASA/TRASFERTA reale di ogni squadra (fonte soccerstats.com), così il vantaggio-casa specifico di ogni squadra è già attivo da ora, non solo a stagione avanzata. Frosinone, Monza e Venezia (neopromosse, senza storico Serie A) usano lo split reale solo dopo aver giocato almeno 5 partite in quel campo; fino ad allora, e per le altre squadre finché l'AI non ha dati sufficienti, resta un vantaggio-casa generico. Il pulsante "🔎 Aggiorna con AI" qui sopra aggiorna in automatico xG/xGA totali e per casa/trasferta di tutte le 20 squadre insieme ai giocatori. <span id="teamXgUpdatedLabel"></span> Il menu a tendina su ogni giocatore resta come riserva manuale solo per i casi in cui l'avversario non viene riconosciuto.
+        La difficoltà di ogni partita si calcola dai GOL ATTESI (xG/xGA), non dai gol reali: lo xG riflette la qualità delle occasioni create/concesse tiro per tiro, quindi è meno soggetto a rimbalzi fortunati o un portiere in giornata no rispetto al risultato secco. Differenziato per ruolo (attacco avversario per portieri/difensori, difesa avversaria per centrocampisti/attaccanti) e stabilizzato mescolando i gol REALI della Serie A 2025/26 (6 partite equivalenti di storico) alle prime giornate di quest'anno — sia per il rendimento generale che per lo split CASA/TRASFERTA reale di ogni squadra (fonte soccerstats.com), così il vantaggio-casa specifico di ogni squadra è già attivo da ora, non solo a stagione avanzata. Frosinone, Monza e Venezia (neopromosse, senza storico Serie A) usano lo split reale solo dopo aver giocato almeno 5 partite in quel campo; fino ad allora, e per le altre squadre finché l'AI non ha dati sufficienti, resta un vantaggio-casa generico. Il pulsante "🔎 Aggiorna con AI" qui sopra aggiorna in automatico xG/xGA totali e per casa/trasferta di tutte le 20 squadre insieme ai giocatori. <span id="teamXgUpdatedLabel"></span> Il menu a tendina su ogni giocatore resta come riserva manuale solo per i casi in cui l'avversario non viene riconosciuto. Stesso principio per la probabilità gol dei singoli giocatori: ogni aggiornamento recupera anche lo xG/90' di ciascuno (corrente e, come prior, quello della stagione scorsa) e il codice calcola IN AUTONOMIA, con un modello di Poisson, una seconda stima indipendente dal giudizio dell'AI; la probabilità mostrata è la media delle due (visibili separate tra parentesi, "AI" vs "xG90"), così una stima AI fuori scala viene comunque ricondotta al dato oggettivo.
       </div>
     </div>
 
@@ -898,6 +898,28 @@
   let TEAM_ATTACK_HOME = {}, TEAM_DEFENSE_HOME = {}, TEAM_ATTACK_AWAY = {}, TEAM_DEFENSE_AWAY = {};
   let teamXgLastUpdate = null; // ISO string, per mostrare "aggiornato Xh fa" in UI
 
+  // ---------- xG per GIOCATORE (stesso principio dello shrinkage di squadra) ----------
+  // L'AI (con web search) recupera per ogni giocatore in rosa lo xG/90' della
+  // stagione corrente e, quando disponibile, lo xG/90' della stagione Serie A
+  // precedente come prior. Qui li mescoliamo con uno shrinkage bayesiano
+  // pesato sui MINUTI (equivalente a quello pesato sulle partite usato per le
+  // squadre): con pochi minuti giocati quest'anno pesa di più il prior
+  // storico, che scompare da solo mano a mano che si accumula minutaggio
+  // reale nella stagione in corso. Persistito in locale (Store) così non va
+  // richiesto da zero ad ogni aggiornamento, ma solo raffinato.
+  // key = normalizeName(nome giocatore) -> { xg90, minutes, xg90Prev, minutesPrev, lastUpdate }
+  let PLAYER_XG_STATS = {};
+  // Peso del prior in "minuti equivalenti": ~3 partite da titolare. Stessa
+  // logica di PRIOR_SEASON_WEIGHT_GAMES ma su minuti invece che partite,
+  // perché il campione di un giocatore si misura meglio in minuti giocati
+  // che in presenze (subentri, infortuni, ecc. rendono le partite disomogenee).
+  const PLAYER_PRIOR_WEIGHT_MINUTES = 270;
+  // Sotto questa soglia di minuti giocati LA STAGIONE SCORSA, il dato xG/90
+  // di quella stagione è troppo rumoroso per fare da prior affidabile (es.
+  // un giocatore con 3 spezzoni da 10') e viene ignorato piuttosto che
+  // introdurre un prior fuorviante.
+  const MIN_PREV_MINUTES_FOR_PRIOR = 450;
+
   // Sotto questa soglia di partite giocate in un dato campo (casa o
   // trasferta) senza uno storico comparabile (LAST_SEASON_VENUE_STATS) NON
   // si usa lo split per quella squadra — vale solo per le neopromosse, che
@@ -978,6 +1000,53 @@
   }
   recomputeTeamRatings();
 
+  // xG/90' "vero" del giocatore: media pesata tra la stagione corrente (peso
+  // = minuti giocati finora) e il prior della stagione scorsa (peso fisso
+  // PLAYER_PRIOR_WEIGHT_MINUTES) — stessa formula di shrinkage usata sopra
+  // per le squadre, solo con minuti al posto di partite. Ritorna null se non
+  // c'è nessun dato utilizzabile (giocatore mai aggiornato dall'AI, o 0
+  // minuti sia quest'anno che l'anno scorso).
+  function blendPlayerXg90(stats){
+    if(!stats) return null;
+    const curMin = stats.minutes || 0;
+    const hasPrior = typeof stats.xg90Prev === 'number' && (stats.minutesPrev||0) >= MIN_PREV_MINUTES_FOR_PRIOR;
+    if(curMin <= 0){
+      // Nessun minuto quest'anno (es. infortunio lungo, neo-acquisto non ancora
+      // esordito): l'unico dato disponibile è il prior, se c'è.
+      return hasPrior ? stats.xg90Prev : (typeof stats.xg90==='number' ? stats.xg90 : null);
+    }
+    if(typeof stats.xg90 !== 'number') return hasPrior ? stats.xg90Prev : null;
+    if(!hasPrior) return stats.xg90; // nessun prior comparabile: xG di quest'anno così com'è
+    const K = PLAYER_PRIOR_WEIGHT_MINUTES;
+    return (stats.xg90*curMin + stats.xg90Prev*K) / (curMin + K);
+  }
+
+  // Minuti attesi nella prossima partita, stimati dalla probabilità di
+  // titolarità che l'AI restituisce (0-100): un titolare "sicuro" non fa mai
+  // 90' pieni in media (cambi, recuperi), un giocatore infortunato/squalificato
+  // ha 0 minuti attesi indipendentemente da qualsiasi probabilità residua.
+  const EXPECTED_MINUTES_IF_STARTER = 85;
+  function estimatedMinutesNextMatch(p){
+    if(p.status==='infortunato' || p.status==='squalificato') return 0;
+    const prob = (typeof p.titolaritaProb==='number') ? p.titolaritaProb
+      : (p.status==='titolare' ? 85 : p.status==='ballottaggio' ? 45 : p.status==='panchina' ? 10 : 0);
+    return clampNum(prob/100 * EXPECTED_MINUTES_IF_STARTER, 0, EXPECTED_MINUTES_IF_STARTER, 0);
+  }
+
+  // Probabilità di segnare ALMENO un gol, calcolata in autonomia (nessun
+  // input dall'AI oltre ai dati grezzi xG90/minuti) con un modello di Poisson:
+  // lambda = tasso di gol atteso nei minuti che il giocatore probabilmente
+  // giocherà, P(>=1 gol) = 1 - e^-lambda. Ritorna null se non c'è ancora
+  // nessun dato xG per quel giocatore (mai passato per un aggiornamento AI).
+  function computePGolStat(p){
+    const stats = PLAYER_XG_STATS[normalizeName(p.name)];
+    const xg90 = blendPlayerXg90(stats);
+    if(xg90 == null) return null;
+    const minutes = estimatedMinutesNextMatch(p);
+    if(minutes <= 0) return 0;
+    const lambda = (xg90/90) * minutes;
+    return (1 - Math.exp(-lambda)) * 100;
+  }
 
   function normalizeTeamName(s){
     return (s||'').toLowerCase()
@@ -1176,6 +1245,13 @@
       }
     }catch(e){ /* keep default (dati xG incorporati nel codice) */ }
     try{
+      const pxg = await Store.get('fanta-player-xg-stats');
+      if(pxg){
+        const parsed = JSON.parse(pxg);
+        if(parsed && typeof parsed === 'object') PLAYER_XG_STATS = parsed;
+      }
+    }catch(e){ /* keep default (nessuno storico xG giocatori ancora) */ }
+    try{
       const b = await Store.get('fanta-bonus-config');
       if(b) Object.assign(FANTA_BONUS, JSON.parse(b));
     }catch(e){ /* keep default */ }
@@ -1203,6 +1279,9 @@
   }
   async function saveTeamXgStats(){
     await Store.set('fanta-team-xg-stats', JSON.stringify({ stats: TEAM_XG_STATS, updatedAt: teamXgLastUpdate }));
+  }
+  async function savePlayerXgStats(){
+    await Store.set('fanta-player-xg-stats', JSON.stringify(PLAYER_XG_STATS));
   }
   async function saveBonusConfig(){
     await Store.set('fanta-bonus-config', JSON.stringify(FANTA_BONUS));
@@ -1298,7 +1377,7 @@
           ${(p.role==='P'||p.role==='D') && typeof p.cleanSheetProb==='number' ? `<div class="player-note" style="font-style:normal;">🧤 Porta inviolata: <b>${Math.round(p.cleanSheetProb)}%</b>${typeof p.shotsConcededAvg==='number' ? ` · ${p.shotsConcededAvg} tiri subiti/gara` : ''}</div>` : ''}
           ${p.role==='P' && typeof p.expectedGoalsConceded==='number' ? `<div class="player-note" style="font-style:normal;">🥅 Gol attesi subiti: <b>${p.expectedGoalsConceded.toFixed(2)}</b> <span style="color:var(--ink-soft);">(malus ~${(p.expectedGoalsConceded*FANTA_BONUS.golSubito).toFixed(2)} pt)</span></div>` : ''}
           ${(p.role==='P'||p.role==='D') && Object.values(formation.slots).includes(p.id) && fieldedDefMod.avgVoto!=null ? `<div class="player-note" style="font-style:normal;">🛡️ Concorre al modificatore difesa di squadra: <b>${fieldedDefMod.modifier>=0?'+':''}${fieldedDefMod.modifier.toFixed(2)}</b> <span style="color:var(--ink-soft);">pt sommato una volta al totale squadra (media portiere + migliori 3 difensori: ${fieldedDefMod.avgVoto.toFixed(2)})</span></div>` : ''}
-          ${typeof p.pGol==='number' && (p.role==='A'||p.role==='C') ? `<div class="player-note" style="font-style:normal;">⚽ Prob. gol: <b>${Math.round(p.pGol)}%</b></div>` : ''}
+          ${typeof p.pGol==='number' && (p.role==='A'||p.role==='C') ? `<div class="player-note" style="font-style:normal;">⚽ Prob. gol: <b>${Math.round(p.pGol)}%</b>${typeof p.pGolAI==='number' && typeof p.pGolStat==='number' ? ` <span style="color:var(--ink-soft);">(AI ${Math.round(p.pGolAI)}% · xG90 ${Math.round(p.pGolStat)}%)</span>` : ''}</div>` : ''}
           ${p.rigorista && typeof p.pRigoreSbagliato==='number' ? `<div class="player-note" style="font-style:normal;">🎯 Rischio rigore sbagliato: <b>${Math.round(p.pRigoreSbagliato)}%</b></div>` : ''}
           ${typeof p.pPotm==='number' && p.pPotm>=15 ? `<div class="player-note" style="font-style:normal;">⭐ Prob. Player of the Match: <b>${Math.round(p.pPotm)}%</b></div>` : ''}
           ${p.rigorista ? `<div class="player-note" style="font-style:normal;">🎯 Rigorista/piazzati</div>` : ''}
@@ -1958,7 +2037,33 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       if(typeof entry.titolarita_prob === 'number') p.titolaritaProb = clampNum(entry.titolarita_prob, 0, 100, p.titolaritaProb);
       if(typeof entry.forma === 'number') p.forma = clampNum(entry.forma, -2, 2, p.forma);
       if(typeof entry.fantavoto_atteso === 'number') p.fantavotoAtteso = clampNum(entry.fantavoto_atteso, 1, 10, p.fantavotoAtteso);
-      if(typeof entry.p_gol === 'number') p.pGol = clampNum(entry.p_gol, 0, 100, p.pGol);
+      // p_gol dell'AI (mescola xG, tiri attesi, quote scommesse marcatore: il
+      // suo giudizio "olistico") viene tenuto da parte come pGolAI e non
+      // scritto subito in p.pGol: prima aggiorniamo PLAYER_XG_STATS con i dati
+      // grezzi xG90/minuti e calcoliamo IN AUTONOMIA (nessun input AI, solo
+      // Poisson su xG90 blendato con lo storico) una seconda stima pGolStat.
+      // p.pGol finale, quello usato da tutto il resto del calcolo, è la media
+      // delle due: riduce sia il rischio di stime AI mal calibrate sia quello
+      // di ignorare segnali "di mercato" (quote) che lo xG puro non cattura.
+      if(typeof entry.p_gol === 'number') p.pGolAI = clampNum(entry.p_gol, 0, 100, p.pGolAI);
+      const pxgKey = normalizeName(p.name);
+      const prevPxg = PLAYER_XG_STATS[pxgKey] || {};
+      const xg90Cur = clampNum(entry.xg90_corrente, 0, 3, null);
+      const minCur = clampNum(entry.minuti_corrente, 0, 5000, null);
+      const xg90Prev = clampNum(entry.xg90_prec, 0, 3, (typeof prevPxg.xg90Prev==='number') ? prevPxg.xg90Prev : null);
+      const minPrev = clampNum(entry.minuti_prec, 0, 5000, (typeof prevPxg.minutesPrev==='number') ? prevPxg.minutesPrev : null);
+      if(xg90Cur !== null && minCur !== null){
+        PLAYER_XG_STATS[pxgKey] = { xg90: xg90Cur, minutes: minCur, xg90Prev, minutesPrev: minPrev, lastUpdate: now };
+      } else if(xg90Prev !== null && typeof prevPxg.xg90 !== 'number'){
+        // Nessun dato di quest'anno ma un prior valido (es. neo-titolare senza
+        // ancora minuti sufficienti): salva comunque il prior da solo.
+        PLAYER_XG_STATS[pxgKey] = { xg90: prevPxg.xg90 ?? null, minutes: prevPxg.minutes || 0, xg90Prev, minutesPrev: minPrev, lastUpdate: now };
+      }
+      const pGolStat = computePGolStat(p);
+      p.pGolStat = pGolStat;
+      if(typeof p.pGolAI === 'number'){
+        p.pGol = (pGolStat !== null) ? clampNum((p.pGolAI + pGolStat)/2, 0, 100, p.pGolAI) : p.pGolAI;
+      }
       if(typeof entry.p_assist === 'number') p.pAssist = clampNum(entry.p_assist, 0, 100, p.pAssist);
       if(typeof entry.p_ammonizione === 'number') p.pAmmonizione = clampNum(entry.p_ammonizione, 0, 100, p.pAmmonizione);
       if(typeof entry.p_espulsione === 'number') p.pEspulsione = clampNum(entry.p_espulsione, 0, 100, p.pEspulsione);
@@ -2024,7 +2129,9 @@ Per ciascun giocatore, ESATTAMENTE con lo stesso nome fornito, valuta:
 - probabilità stimata di essere titolare (0-100)
 - forma attuale (-2 pessima, 0 normale, +2 ottima)
 - fantavoto medio atteso (numero tipo 6.2, voto puro, senza bonus/malus)
-- probabilità (0-100) che segni almeno un gol in questa partita: usa xG/tiri attesi MA anche la quota scommesse "marcatore/anytime goalscorer" quando disponibile, spesso il segnale più affidabile sui favoriti del turno
+- probabilità (0-100) che segni almeno un gol in questa partita: usa xG/tiri attesi MA anche la quota scommesse "marcatore/anytime goalscorer" quando disponibile, spesso il segnale più affidabile sui favoriti del turno. IMPORTANTE: diffida dei gol grezzi fatti nelle ultime 1-2 partite, possono essere semplice varianza (un tiro deviato, un portiere in giornata no) — dai più peso allo xG salvo che lo scostamento gol-vs-xG sia persistente su più stagioni o abbia una spiegazione strutturale (es. è il rigorista designato, è uno storico ottimo finalizzatore rispetto al suo xG)
+- xG per 90 minuti giocati in QUESTA stagione (fonte fbref/understat/sofascore, sezione "per 90"), e i minuti totali giocati in campionato finora in questa stagione: dato grezzo, serve al codice per calcolare in autonomia una probabilità gol statistica indipendente dalla tua; null se il giocatore ha troppo pochi minuti (<60') per un dato affidabile
+- xG per 90 minuti nella stagione di Serie A PRECEDENTE (${prevSeason}), SOLO se il giocatore ha giocato almeno 450 minuti in quella stagione in Serie A; altrimenti lascia null SENZA stimare (es. nuovo arrivo da campionato estero, promosso dalla Primavera, o troppi pochi minuti l'anno scorso) — e i relativi minuti totali giocati in quella stagione
 - probabilità (0-100) che fornisca almeno un assist in questa partita
 - probabilità (0-100) che venga ammonito
 - probabilità (0-100) che venga espulso in questa partita
@@ -2053,6 +2160,10 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
           "forma": -2 a 2,
           "fantavoto_atteso": numero es. 6.2,
           "p_gol": 0-100,
+          "xg90_corrente": numero o null (es. 0.45; xG/90' in questa stagione ${season}),
+          "minuti_corrente": numero o null (minuti totali giocati in campionato in questa stagione ${season}),
+          "xg90_prec": numero o null (xG/90' nella stagione Serie A precedente ${prevSeason}, SOLO se >=450' giocati, altrimenti null),
+          "minuti_prec": numero o null (minuti totali giocati nella stagione ${prevSeason}, coerente col campo sopra),
           "p_assist": 0-100,
           "p_ammonizione": 0-100,
           "p_espulsione": 0-100,
@@ -2275,6 +2386,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       }
       const summaries = applyFullUpdate(map, result);
       saveRoster();
+      savePlayerXgStats();
       const matchedTeams = new Set(summaries.map(s=>s.team));
       summaries.forEach(s=>{
         const diffText = s.difficulty ? ` · difficoltà ${s.difficulty}` : '';
