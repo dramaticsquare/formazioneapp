@@ -2057,7 +2057,11 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       });
     };
   }
-  const GEMINI_MAX_CONCURRENT = 2;
+  const GEMINI_MAX_CONCURRENT = 1; // sceso da 2 a 1: con 2 il rate limit veniva comunque
+  // raggiunto costantemente, segno che il tetto reale è più basso di quanto pensassimo
+  // (o è un limite giornaliero, non al minuto). Sequenziale è più lento ma più affidabile;
+  // il messaggio di errore ora mostrato nel log dirà se ha senso aumentare di nuovo questo
+  // numero o se serve intervenire altrove (piano/chiave Gemini).
   const limitGeminiCall = createLimiter(GEMINI_MAX_CONCURRENT);
 
   async function anthropicMessagesOnce(payload){
@@ -2092,10 +2096,23 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
         if(!retryable || attempt >= maxRetries) throw err;
         const backoffMs = err.retryAfter ? err.retryAfter*1000 : Math.min(30000, 1000 * Math.pow(2, attempt)) + Math.random()*400;
         attempt++;
-        if(onRetry) onRetry(attempt, Math.round(backoffMs/1000));
+        // Passiamo anche err a onRetry: il corpo dell'errore 429 di Gemini di solito
+        // indica il motivo esatto (es. "quota" per-minuto vs per-giorno, nome della
+        // metrica superata) — utile per capire se ha senso ritentare o se serve
+        // aspettare/cambiare piano, invece di indovinare dal solo status HTTP.
+        if(onRetry) onRetry(attempt, Math.round(backoffMs/1000), err);
         await sleep(backoffMs);
       }
     }
+  }
+
+  // Estrae dal messaggio d'errore un estratto leggibile (il corpo della risposta
+  // 429 di Gemini, inoltrato da update.js) da mostrare nel log, per capire subito
+  // se il limite è "al minuto" (si risolve ritentando/rallentando) o "al giorno"
+  // (ritentare non serve a nulla, va aspettato o cambiato piano/chiave).
+  function errDetail(err){
+    if(!err || !err.message) return '';
+    return ' — ' + err.message.replace(/\s+/g,' ').trim().slice(0, 160);
   }
 
   async function callTeamUpdate(team, players){
@@ -2104,8 +2121,8 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       max_tokens: 1000,
       messages: [{ role: 'user', content: buildPrompt(team, players) }],
       tools: [{ type: 'web_search_20250305', name: 'web_search' }]
-    }, (attempt, waitSec)=>{
-      logStatus(`  ⏳ ${team}: limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})…`);
+    }, (attempt, waitSec, err)=>{
+      logStatus(`  ⏳ ${team}: limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})${errDetail(err)}`);
     });
     const text = (data.content||[])
       .filter(block=>block.type==='text')
@@ -2563,11 +2580,11 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     logStatus(`In parallelo aggiorno anche xG/xGA di tutte le 20 squadre, in ${xgBatchCount} gruppi da ${TEAM_XG_BATCH_SIZE} (per la difficoltà partita)…`);
     try{
       const [result, xgOutcome] = await Promise.all([
-        callFullUpdate(map, matchday, (attempt, waitSec)=>{
-          logStatus(`  ⏳ limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})…`);
+        callFullUpdate(map, matchday, (attempt, waitSec, err)=>{
+          logStatus(`  ⏳ limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})${errDetail(err)}`);
         }),
-        callTeamXgUpdate((attempt, waitSec)=>{
-          logStatus(`  ⏳ xG squadre: limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})…`);
+        callTeamXgUpdate((attempt, waitSec, err)=>{
+          logStatus(`  ⏳ xG squadre: limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})${errDetail(err)}`);
         }).then(r=>({ ok:true, data:r })).catch(e=>({ ok:false, error:e }))
       ]);
       if(xgOutcome.ok){
