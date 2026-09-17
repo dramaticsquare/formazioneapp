@@ -2032,6 +2032,2070 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   // Nessuna API key nel browser: la chiave Gemini resta solo lato server (env var GEMINI_API_KEY).
   function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
+  // Limita quante richieste HTTP verso /api/update (quindi verso Gemini) possono
+  // essere realmente "in volo" nello stesso istante, indipendentemente da quanti
+  // batch (xG squadre + update principale) il codice mette in coda insieme.
+  // Senza questo, con più batch in parallelo si supera subito il limite di
+  // richieste/minuto di Gemini e TUTTI i batch ricevono 429 nello stesso momento,
+  // finendo per ritentare tutti insieme (stesso problema, spostato di 16s in 16s).
+  // Lo slot si libera solo quando la richiesta HTTP è davvero conclusa: l'attesa
+  // di backoff tra un tentativo e l'altro NON occupa lo slot, così un altro batch
+  // può passare avanti mentre uno è in pausa dopo un 429.
+  function createLimiter(concurrency){
+    let active = 0;
+    const queue = [];
+    function next(){
+      if(active >= concurrency || queue.length === 0) return;
+      active++;
+      const job = queue.shift();
+      job.fn().then(job.resolve, job.reject).finally(()=>{ active--; next(); });
+    }
+    return function limit(fn){
+      return new Promise((resolve, reject)=>{
+        queue.push({ fn, resolve, reject });
+        next();
+      });
+    };
+  }
+  const GEMINI_MAX_CONCURRENT = 2;
+  const limitGeminiCall = createLimiter(GEMINI_MAX_CONCURRENT);
+
+  async function anthropicMessagesOnce(payload){
+    return limitGeminiCall(async ()=>{
+      const response = await fetch('/api/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if(!response.ok){
+        let detail = '';
+        try{ detail = (await response.json()).error || ''; }catch(e){}
+        const err = new Error('HTTP ' + response.status + (detail ? ': ' + detail : ''));
+        err.status = response.status;
+        err.retryAfter = parseFloat(response.headers.get('retry-after')) || null;
+        throw err;
+      }
+      return response.json();
+    });
+  }
+
+  // Riprova con backoff esponenziale sui 429 (rate limit) e sui 503 (modello sovraccarico),
+  // rispettando l'header Retry-After quando presente. Le altre 4xx non vengono ritentate.
+  async function anthropicMessages(payload, onRetry){
+    const maxRetries = 5;
+    let attempt = 0;
+    while(true){
+      try{
+        return await anthropicMessagesOnce(payload);
+      }catch(err){
+        const retryable = err.status === 429 || err.status === 503;
+        if(!retryable || attempt >= maxRetries) throw err;
+        const backoffMs = err.retryAfter ? err.retryAfter*1000 : Math.min(30000, 1000 * Math.pow(2, attempt)) + Math.random()*400;
+        attempt++;
+        if(onRetry) onRetry(attempt, Math.round(backoffMs/1000));
+        await sleep(backoffMs);
+      }
+    }
+  }
+
+  async function callTeamUpdate(team, players){
+    const data = await anthropicMessages({
+      model: AI_MODEL,
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: buildPrompt(team, players) }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }]
+    }, (attempt, waitSec)=>{
+      logStatus(`  ⏳ ${team}: limite di richieste raggiunto, riprovo tra ${waitSec}s (tentativo ${attempt})…`);
+    });
+    const text = (data.content||[])
+      .filter(block=>block.type==='text')
+      .map(block=>block.text)
+      .join('\n');
+    if(!text.trim()) throw new Error('risposta vuota');
+    return parseAiJson(text);
+  }
+
+  function applyTeamUpdate(team, players, result){
+    const now = new Date().toISOString();
+    let matched = 0;
+    const unmatchedNames = [];
+    const byName = new Map(players.map(p=>[normalizeName(p.name), p]));
+    (result.players||[]).forEach(entry=>{
+      const p = byName.get(normalizeName(entry.name));
+      if(!p){
+        if(entry.name) unmatchedNames.push(entry.name);
+        return;
+      }
+      matched++;
+      if(entry.status && STATUS_LABEL[entry.status]) p.status = entry.status;
+      if(entry.note) p.note = String(entry.note).slice(0,300);
+      if(result.opponent) p.opponent = String(result.opponent).slice(0,200);
+      if(result.difficulty && DIFF_LABEL[result.difficulty]) p.difficulty = result.difficulty;
+      // Stessa logica di blend AI+statistica usata sopra per p_gol, applicata
+      // ai gol attesi subiti (rilevante per P/D): golSubitoStat viene da
+      // computeGoalsConcededStat (solo tassi xG di squadra, nessun input AI),
+      // cleanSheetStat è la probabilità di Poisson di prendere 0 gol dato
+      // quel lambda (e^-lambda). Il valore finale usato dal resto del
+      // calcolo è la media tra AI e statistica, come per p_gol.
+      if(typeof result.clean_sheet_prob === 'number') p.cleanSheetAI = clampNum(result.clean_sheet_prob, 0, 100, p.cleanSheetAI);
+      if(typeof result.goals_conceded_expected === 'number') p.golSubitoAI = clampNum(result.goals_conceded_expected, 0, 10, p.golSubitoAI  }
+
+  .panel{display:none;}
+  .panel.active{display:block;}
+
+  /* ---- Cards / paper sheet aesthetic ---- */
+  .sheet{
+    background:var(--paper);
+    border-radius:var(--radius);
+    padding:14px;
+    box-shadow:0 10px 26px rgba(0,0,0,0.28);
+  }
+  .sheet + .sheet{margin-top:14px;}
+
+  .role-filter{
+    display:flex;
+    gap:6px;
+    margin-bottom:12px;
+    overflow-x:auto;
+  }
+  .role-filter button{
+    border:1.5px solid rgba(18,32,26,0.15);
+    background:transparent;
+    color:var(--ink);
+    font-weight:700;
+    font-size:12.5px;
+    padding:6px 12px;
+    border-radius:var(--radius-pill);
+    cursor:pointer;
+    white-space:nowrap;
+  }
+  .role-filter button.active{
+    background:var(--ink);
+    color:var(--paper);
+    border-color:var(--ink);
+  }
+
+  .player-row{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px 4px;
+    border-bottom:1px solid rgba(18,32,26,0.1);
+  }
+  .player-row:last-child{border-bottom:none;}
+  .role-chip{
+    flex:0 0 auto;
+    width:26px;height:26px;
+    border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    font-family:'Bebas Neue',sans-serif;
+    font-size:14px;
+    color:#fff;
+  }
+  .role-chip.P{background:#5B7B5E;}
+  .role-chip.D{background:#3F6B8F;}
+  .role-chip.C{background:#8A6A3F;}
+  .role-chip.A{background:#9B3F42;}
+
+  .player-info{flex:1 1 auto;min-width:0;}
+  .player-name{font-weight:700;font-size:14.5px;color:var(--ink);}
+  .player-meta{font-size:12px;color:var(--ink-soft);margin-top:1px;}
+  .player-meta input{
+    border:none;background:transparent;font-size:12px;color:var(--ink-soft);
+    font-family:'Inter',sans-serif;width:100%;padding:0;
+  }
+  .player-meta input:focus{outline:none;border-bottom:1px solid var(--gold);}
+
+  .status-select{
+    flex:0 0 auto;
+    font-family:'Inter',sans-serif;
+    font-weight:700;
+    font-size:11px;
+    border:none;
+    padding:5px 8px;
+    border-radius:var(--radius-pill);
+    cursor:pointer;
+    appearance:none;
+    -webkit-appearance:none;
+    text-align:center;
+    color:#fff;
+  }
+  .status-select.titolare{background:var(--green-ok);}
+  .status-select.ballottaggio{background:var(--amber);}
+  .status-select.panchina{background:var(--grey);color:#20281f;}
+  .status-select.infortunato{background:var(--red);}
+  .status-select.squalificato{background:#5A4A6E;}
+
+  .diff-badge{
+    flex:0 0 auto;
+    font-size:10px;
+    font-weight:800;
+    padding:4px 7px;
+    border-radius:var(--radius-pill);
+    color:#fff;
+    text-transform:uppercase;
+    letter-spacing:0.3px;
+  }
+  .diff-badge.facile{background:var(--green-ok);}
+  .diff-badge.media{background:var(--amber);}
+  .diff-badge.difficile{background:var(--red);}
+
+  .player-note{
+    font-size:11.5px;
+    color:var(--ink-soft);
+    margin-top:2px;
+    font-style:italic;
+    line-height:1.3;
+  }
+
+  .del-btn{
+    flex:0 0 auto;
+    border:none;background:none;color:#B08585;font-size:16px;cursor:pointer;
+    padding:2px 4px;
+    opacity:0.6;
+  }
+  .del-btn:hover{opacity:1;}
+
+  .empty-state{
+    text-align:center;
+    padding:30px 10px;
+    color:var(--ink-soft);
+    font-size:13.5px;
+  }
+
+  /* ---- Add player form ---- */
+  .add-toggle{
+    width:100%;
+    margin-top:14px;
+    background:var(--gold);
+    color:#2A1C05;
+    border:none;
+    font-family:'Inter',sans-serif;
+    font-weight:800;
+    font-size:14px;
+    padding:12px;
+    border-radius:var(--radius);
+    cursor:pointer;
+  }
+  .add-form{
+    display:none;
+    margin-top:12px;
+  }
+  .add-form.open{display:block;}
+  .field-row{display:flex;gap:8px;margin-bottom:8px;}
+  .field-row > *{flex:1;}
+  .field-row.thirds > *{flex:1 1 0;}
+  input.text-input, select.text-input{
+    width:100%;
+    border:1.5px solid rgba(18,32,26,0.18);
+    background:#fff;
+    border-radius:var(--radius);
+    padding:9px 10px;
+    font-family:'Inter',sans-serif;
+    font-size:13.5px;
+    color:var(--ink);
+  }
+  input.text-input:focus, select.text-input:focus{outline:none;border-color:var(--gold);}
+  .submit-btn{
+    width:100%;
+    background:var(--ink);
+    color:var(--paper);
+    border:none;
+    font-weight:800;
+    font-size:13.5px;
+    padding:11px;
+    border-radius:var(--radius);
+    cursor:pointer;
+    margin-top:4px;
+  }
+
+  /* ---- Formazione tab ---- */
+  .module-row{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    margin-bottom:14px;
+  }
+  .module-row label{
+    color:#C7D3C9;
+    font-size:12.5px;
+    font-weight:700;
+  }
+  select#moduleSelect{
+    background:rgba(0,0,0,0.25);
+    color:var(--line);
+    border:1.5px solid rgba(255,255,255,0.15);
+    border-radius:var(--radius);
+    padding:8px 10px;
+    font-weight:700;
+    font-family:'Inter',sans-serif;
+  }
+  .auto-btn{
+    background:transparent;
+    border:1.5px solid var(--gold);
+    color:var(--gold);
+    font-weight:700;
+    font-size:12px;
+    padding:8px 12px;
+    border-radius:var(--radius-pill);
+    cursor:pointer;
+  }
+
+  .pitch{
+    position:relative;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), transparent 30%),
+      repeating-linear-gradient(180deg, #1E4E2F 0 34px, #1B4629 34px 68px);
+    border-radius:8px;
+    padding:14px 8px 10px;
+    border:2px solid rgba(255,255,255,0.35);
+    overflow:hidden;
+  }
+  .pitch::before{
+    content:"";
+    position:absolute;
+    left:50%;top:50%;
+    width:88px;height:88px;
+    border:1.5px solid rgba(255,255,255,0.35);
+    border-radius:50%;
+    transform:translate(-50%,-50%);
+    pointer-events:none;
+  }
+  .pitch::after{
+    content:"";
+    position:absolute;
+    left:0;right:0;top:50%;
+    border-top:1.5px solid rgba(255,255,255,0.35);
+    pointer-events:none;
+  }
+  .pitch-box-top, .pitch-box-bottom{
+    position:absolute;left:50%;
+    width:150px;height:34px;
+    border:1.5px solid rgba(255,255,255,0.3);
+    transform:translateX(-50%);
+    pointer-events:none;
+  }
+  .pitch-box-top{top:0;border-top:none;}
+  .pitch-box-bottom{bottom:0;border-bottom:none;}
+
+  .pitch-row{
+    position:relative;
+    display:flex;
+    justify-content:space-evenly;
+    align-items:flex-start;
+    margin:14px 0;
+    z-index:2;
+  }
+  .slot{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:4px;
+    cursor:pointer;
+    width:64px;
+  }
+  .slot-badge{
+    width:38px;height:38px;
+    border-radius:50%;
+    background:rgba(255,255,255,0.94);
+    border:2px solid rgba(255,255,255,0.9);
+    display:flex;align-items:center;justify-content:center;
+    font-family:'Bebas Neue',sans-serif;
+    font-size:16px;
+    color:var(--ink);
+    box-shadow:0 3px 8px rgba(0,0,0,0.35);
+  }
+  .slot-badge.empty{
+    background:rgba(255,255,255,0.12);
+    border:2px dashed rgba(255,255,255,0.5);
+    color:rgba(255,255,255,0.7);
+    font-size:20px;
+  }
+  .slot-badge.status-titolare{border-color:var(--green-ok);}
+  .slot-badge.status-ballottaggio{border-color:var(--amber);}
+  .slot-badge.status-panchina{border-color:var(--grey);}
+  .slot-badge.status-infortunato{border-color:var(--red);}
+  .slot-badge.status-squalificato{border-color:#5A4A6E;}
+  .slot-label{
+    font-size:10.5px;
+    font-weight:700;
+    color:#EFEFE6;
+    text-align:center;
+    line-height:1.15;
+    text-shadow:0 1px 2px rgba(0,0,0,0.6);
+  }
+  .slot-sub{
+    font-size:9px;
+    color:#C9D6CC;
+    text-shadow:0 1px 2px rgba(0,0,0,0.6);
+  }
+
+  .bench-title{
+    color:#C7D3C9;
+    font-size:12.5px;
+    font-weight:700;
+    margin:18px 0 8px 2px;
+  }
+  .bench-list{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+  }
+  .bench-chip{
+    background:rgba(0,0,0,0.25);
+    border:1.5px solid rgba(255,255,255,0.15);
+    color:var(--line);
+    font-size:12px;
+    font-weight:600;
+    padding:6px 10px;
+    border-radius:var(--radius-pill);
+    display:flex;
+    align-items:center;
+    gap:6px;
+  }
+  .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;}
+  .dot.status-titolare{background:var(--green-ok);}
+  .dot.status-ballottaggio{background:var(--amber);}
+  .dot.status-panchina{background:var(--grey);}
+  .dot.status-infortunato{background:var(--red);}
+  .dot.status-squalificato{background:#8B7BAF;}
+
+  /* ---- Picker overlay ---- */
+  .picker-backdrop{
+    display:none;
+    position:fixed;inset:0;
+    background:rgba(10,18,13,0.72);
+    z-index:50;
+    align-items:flex-end;
+    justify-content:center;
+  }
+  .picker-backdrop.open{display:flex;}
+  .picker-sheet{
+    background:var(--paper);
+    width:100%;
+    max-width:640px;
+    max-height:72vh;
+    overflow-y:auto;
+    border-radius:14px 14px 0 0;
+    padding:16px 14px 24px;
+  }
+  .picker-sheet h3{
+    font-family:'Bebas Neue',sans-serif;
+    font-size:22px;
+    margin:0 0 10px;
+    letter-spacing:0.4px;
+    color:var(--ink);
+  }
+  .picker-option{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px 6px;
+    border-bottom:1px solid rgba(18,32,26,0.1);
+    cursor:pointer;
+  }
+  .picker-option:hover{background:rgba(217,164,65,0.12);}
+  .picker-close{
+    display:block;
+    width:100%;
+    text-align:center;
+    margin-top:12px;
+    background:transparent;
+    border:1.5px solid rgba(18,32,26,0.2);
+    padding:10px;
+    border-radius:var(--radius-pill);
+    font-weight:700;
+    color:var(--ink-soft);
+    cursor:pointer;
+  }
+
+  .footnote{
+    text-align:center;
+    color:#8FA093;
+    font-size:11.5px;
+    margin-top:22px;
+    padding:0 10px;
+  }
+
+  /* ---- AI update bar ---- */
+  .ai-bar{
+    background:rgba(0,0,0,0.22);
+    border:1px solid rgba(255,255,255,0.12);
+    border-radius:var(--radius);
+    padding:12px;
+    margin-bottom:14px;
+  }
+  .ai-update-btn{
+    width:100%;
+    background:var(--gold);
+    color:#2A1C05;
+    border:none;
+    font-family:'Inter',sans-serif;
+    font-weight:800;
+    font-size:13.5px;
+    padding:12px;
+    border-radius:var(--radius);
+    cursor:pointer;
+    display:flex;align-items:center;justify-content:center;gap:8px;
+  }
+  .ai-update-btn:disabled{opacity:0.6;cursor:default;}
+  .ai-spinner{
+    width:14px;height:14px;
+    border-radius:50%;
+    border:2px solid rgba(42,28,5,0.35);
+    border-top-color:#2A1C05;
+    animation:spin .7s linear infinite;
+    display:none;
+  }
+  .ai-update-btn.loading .ai-spinner{display:inline-block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .ai-status{
+    margin-top:10px;
+    font-size:12px;
+    color:#C7D3C9;
+    line-height:1.5;
+    max-height:140px;
+    overflow-y:auto;
+  }
+  .ai-status .line{padding:2px 0;}
+  .ai-status .line.err{color:#E39B9B;}
+  .ai-status .line.ok{color:#9FD3AC;}
+  .ai-hint{
+    font-size:11px;
+    color:#8FA093;
+    margin-top:8px;
+    line-height:1.4;
+  }
+  .update-badge{
+    font-size:10px;
+    color:#8FA093;
+    font-weight:600;
+  }
+  .update-badge.fresh{ color:#4a9d5f; }
+  .update-badge.stale{ color:#c98a2b; }
+  .update-badge.old{ color:#c0453f; }
+
+  .weights-box{
+    background:rgba(0,0,0,0.22);
+    border:1px solid rgba(255,255,255,0.12);
+    border-radius:var(--radius);
+    padding:10px 12px;
+    margin-bottom:14px;
+  }
+  .weights-title{
+    color:#C7D3C9;
+    font-size:11.5px;
+    font-weight:700;
+    margin-bottom:8px;
+  }
+  .weight-row{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin-bottom:6px;
+  }
+  .weight-row:last-child{margin-bottom:0;}
+  .weight-row span:first-child{
+    flex:0 0 118px;
+    font-size:12px;
+    color:#DCE6DA;
+  }
+  .weight-row input[type=range]{flex:1;accent-color:var(--gold);}
+  .weight-val{
+    flex:0 0 30px;
+    font-size:11px;
+    color:var(--gold);
+    font-weight:700;
+    text-align:right;
+  }
+  .slot-score{
+    font-size:9px;
+    color:var(--gold);
+    font-weight:700;
+  }
+  .bench-chip.unavailable{
+    border-color:rgba(184,74,74,0.5);
+    background:rgba(184,74,74,0.12);
+  }
+  .bench-rank{
+    font-family:'Bebas Neue',sans-serif;
+    font-size:12px;
+    color:var(--gold);
+    margin-right:1px;
+  }
+
+  .settings-toggle{
+    background:rgba(0,0,0,0.25);
+    border:1px solid rgba(255,255,255,0.15);
+    color:var(--line);
+    font-size:15px;
+    width:32px;height:32px;
+    border-radius:50%;
+    cursor:pointer;
+    flex:0 0 auto;
+  }
+  .settings-panel{
+    display:none;
+    background:rgba(0,0,0,0.28);
+    border:1px solid rgba(255,255,255,0.15);
+    border-radius:var(--radius);
+    padding:12px;
+    margin:0 0 14px;
+  }
+  .settings-panel.open{display:block;}
+  .settings-title{color:var(--line);font-weight:700;font-size:13px;margin-bottom:6px;}
+  .settings-text{color:#A9BBAE;font-size:11.5px;line-height:1.5;margin-bottom:10px;}
+  .settings-text a{color:var(--gold);}
+
+  ::-webkit-scrollbar{height:6px;width:6px;}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:4px;}
+.stats-table{border-collapse:collapse;width:100%;font-size:10.5px;white-space:nowrap;}
+.stats-table th,.stats-table td{padding:4px 7px;text-align:right;border-bottom:1px solid rgba(255,255,255,0.08);}
+.stats-table th:first-child,.stats-table td:first-child{text-align:left;position:sticky;left:0;background:#1b2a20;}
+.stats-table th{color:#8C9A90;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.02em;}
+.stats-table tbody tr:hover{background:rgba(255,255,255,0.04);}
+.stats-table .sub{color:var(--ink-soft);font-size:9.5px;}
+.stats-table-title{font-size:12px;font-weight:600;color:#DCE6DF;margin:10px 0 4px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="eyebrow-row">
+      <h1>La Distinta</h1>
+    </div>
+    <div class="sub" id="statusLine">Caricamento rosa…</div>
+  </header>
+
+  <nav class="tabs">
+    <button class="active" data-tab="rosa">Rosa</button>
+    <button data-tab="formazione">Formazione</button>
+  </nav>
+
+  <!-- ROSA -->
+  <section class="panel active" id="panel-rosa">
+    <div class="ai-bar">
+      <div class="field-row" style="margin-bottom:8px;">
+        <label for="matchdayInput" style="font-size:12px;color:var(--ink-soft);">Giornata di riferimento (opzionale, disambigua "prossima" da "appena giocata")</label>
+        <input class="text-input" id="matchdayInput" type="number" min="1" max="38" placeholder="es. 4">
+      </div>
+      <button class="ai-update-btn" id="aiUpdateBtn">
+        <span class="ai-spinner"></span>
+        <span id="aiUpdateBtnLabel">🔎 Aggiorna con AI — titolarità, ballottaggi, scontri diretti</span>
+      </button>
+      <div class="ai-status" id="aiStatus"></div>
+      <div class="ai-hint">Cerca sul web per ogni squadra della tua rosa: probabili formazioni, ballottaggi, infortuni/squalifiche, difficoltà della prossima partita, rigoristi e trend di forma. Verifica sempre le formazioni ufficiali vicino al fischio d'inizio.</div>
+    </div>
+    <div class="sheet">
+      <div class="role-filter" id="roleFilter">
+        <button class="active" data-role="TUTTI">Tutti</button>
+        <button data-role="P">Portieri</button>
+        <button data-role="D">Difensori</button>
+        <button data-role="C">Centrocampisti</button>
+        <button data-role="A">Attaccanti</button>
+      </div>
+      <div id="playerList"></div>
+    </div>
+
+    <button class="add-toggle" id="addToggle">+ Aggiungi giocatore</button>
+    <div class="sheet add-form" id="addForm">
+      <div class="field-row thirds">
+        <input class="text-input" id="f-name" placeholder="Nome giocatore">
+        <select class="text-input" id="f-role">
+          <option value="P">Portiere</option>
+          <option value="D">Difensore</option>
+          <option value="C">Centrocampista</option>
+          <option value="A">Attaccante</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <input class="text-input" id="f-team" placeholder="Squadra reale (es. Inter)">
+      </div>
+      <div class="field-row">
+        <input class="text-input" id="f-opponent" placeholder="Prossimo avversario (es. Milan, trasferta)">
+      </div>
+      <div class="field-row">
+        <select class="text-input" id="f-status">
+          <option value="titolare">Titolare</option>
+          <option value="ballottaggio">Ballottaggio</option>
+          <option value="panchina">In panchina</option>
+          <option value="infortunato">Infortunato</option>
+          <option value="squalificato">Squalificato</option>
+        </select>
+        <select class="text-input" id="f-difficulty">
+          <option value="facile">Avversario facile</option>
+          <option value="media" selected>Avversario medio</option>
+          <option value="difficile">Avversario difficile</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <input class="text-input" id="f-note" placeholder="Nota (media voto, trend, motivazioni…)">
+      </div>
+      <button class="submit-btn" id="saveBtn">Salva in rosa</button>
+    </div>
+  </section>
+
+  <!-- FORMAZIONE -->
+  <section class="panel" id="panel-formazione">
+    <div class="module-row">
+      <div>
+        <label for="moduleSelect">Modulo</label><br>
+        <select id="moduleSelect">
+          <option value="3-4-3">3-4-3 (no bonus difesa nella tua lega)</option>
+          <option value="3-5-2">3-5-2 (no bonus difesa nella tua lega)</option>
+          <option value="4-3-3" selected>4-3-3</option>
+          <option value="4-4-2">4-4-2</option>
+          <option value="4-5-1">4-5-1</option>
+          <option value="5-3-2">5-3-2</option>
+          <option value="5-4-1">5-4-1</option>
+        </select>
+      </div>
+      <button class="auto-btn" id="autoBtn">🤖 Schiera l'undici migliore</button>
+    </div>
+    <div id="moduleDefWarning" style="display:none;text-align:center;font-size:11.5px;color:#c0453f;margin:-4px 0 8px;">⚠️ Con questo modulo schieri solo 3 difensori: nella tua lega il bonus/modificatore difesa non si attiva (serve minimo 4 in campo). "🤖 Schiera l'undici migliore" sceglie sempre un modulo a 4 o 5 difensori per farlo scattare.</div>
+    <div id="formationTotal" style="text-align:center;font-size:13px;color:#5b6b5e;margin:-6px 0 10px;"></div>
+
+    <div class="weights-box">
+      <div class="weights-title">Peso dei criteri nella scelta automatica</div>
+      <div id="weightsRationale" style="font-size:11px;color:#8C9A90;margin:-2px 0 8px;">
+        Valori consigliati (bloccati di default) per evitare di tarare i pesi a occhio finché non escono i giocatori che si preferisce. Titolarità pesa di più perché senza minutaggio tutto il resto vale zero; difficoltà pesa meno perché è già in parte dentro la stima del voto atteso.
+      </div>
+      <div class="weight-row">
+        <span>Titolarità</span>
+        <input type="range" class="weight-slider" data-weight="titolarita" min="0" max="2" step="0.25" value="1.5" disabled>
+        <span class="weight-val" id="w-titolarita-val">1.5×</span>
+      </div>
+      <div class="weight-row">
+        <span>Forma / bonus</span>
+        <input type="range" class="weight-slider" data-weight="forma" min="0" max="2" step="0.25" value="1" disabled>
+        <span class="weight-val" id="w-forma-val">1×</span>
+      </div>
+      <div class="weight-row">
+        <span>Difficoltà avversario</span>
+        <input type="range" class="weight-slider" data-weight="difficolta" min="0" max="2" step="0.25" value="0.5" disabled>
+        <span class="weight-val" id="w-difficolta-val">0.5×</span>
+      </div>
+      <button id="unlockWeightsBtn" type="button" style="margin-top:4px;font-size:11px;background:none;border:1px solid rgba(255,255,255,0.25);color:#B9C7BC;border-radius:6px;padding:4px 8px;cursor:pointer;">🔒 Sblocca pesi personalizzati</button>
+    </div>
+
+    <div id="matchDifficultyBox" class="weights-box">
+      <div class="weights-title">Difficoltà partita: calcolata, non a occhio</div>
+      <div style="font-size:11px;color:#8C9A90;">
+        La difficoltà di ogni partita si calcola dai GOL ATTESI (xG/xGA), non dai gol reali: lo xG riflette la qualità delle occasioni create/concesse tiro per tiro, quindi è meno soggetto a rimbalzi fortunati o un portiere in giornata no rispetto al risultato secco. Differenziato per ruolo (attacco avversario per portieri/difensori, difesa avversaria per centrocampisti/attaccanti) e stabilizzato mescolando i gol REALI della Serie A 2025/26 (6 partite equivalenti di storico) alle prime giornate di quest'anno — sia per il rendimento generale che per lo split CASA/TRASFERTA reale di ogni squadra (fonte soccerstats.com), così il vantaggio-casa specifico di ogni squadra è già attivo da ora, non solo a stagione avanzata. Frosinone, Monza e Venezia (neopromosse, senza storico Serie A) usano lo split reale solo dopo aver giocato almeno 5 partite in quel campo; fino ad allora, e per le altre squadre finché l'AI non ha dati sufficienti, resta un vantaggio-casa generico. Il pulsante "🔎 Aggiorna con AI" qui sopra aggiorna in automatico xG/xGA totali e per casa/trasferta di tutte le 20 squadre insieme ai giocatori. <span id="teamXgUpdatedLabel"></span> Il menu a tendina su ogni giocatore resta come riserva manuale solo per i casi in cui l'avversario non viene riconosciuto. Stesso principio per la probabilità gol dei singoli giocatori: ogni aggiornamento recupera anche lo xG/90' di ciascuno (corrente e, come prior, quello della stagione scorsa) e il codice calcola IN AUTONOMIA, con un modello di Poisson, una seconda stima indipendente dal giudizio dell'AI; la probabilità mostrata è la media delle due (visibili separate tra parentesi, "AI" vs "xG90"), così una stima AI fuori scala viene comunque ricondotta al dato oggettivo.
+      </div>
+    </div>
+
+    <div id="statsTablesBox" class="weights-box">
+      <div class="weights-title">📊 Tabella statistiche xG (tracciata nel tempo)</div>
+      <div style="font-size:11px;color:#8C9A90;margin-bottom:8px;">
+        Tutti i dati grezzi usati per calcolare difficoltà, probabilità gol e gol attesi subiti: xG/xGA per squadra (con split casa/trasferta e prior della stagione scorsa) e xG/90' per ciascun giocatore in rosa (con prior della stagione scorsa). Si aggiorna da sola ad ogni "🔎 Aggiorna con AI"; la colonna "storico" mostra le ultime rilevazioni per vedere il trend nel tempo.
+      </div>
+      <button id="toggleStatsTablesBtn" type="button" style="margin-bottom:8px;font-size:11px;background:none;border:1px solid rgba(255,255,255,0.25);color:#B9C7BC;border-radius:6px;padding:4px 8px;cursor:pointer;">Mostra tabelle ▾</button>
+      <div id="statsTablesContent" style="display:none;">
+        <div style="overflow-x:auto;"><div id="teamStatsTableWrap"></div></div>
+        <div style="overflow-x:auto;"><div id="attackStatsTableWrap"></div></div>
+        <div style="overflow-x:auto;"><div id="defenseStatsTableWrap"></div></div>
+      </div>
+    </div>
+
+    <div class="weights-box">
+      <div class="weights-title">Bonus/malus personalizzati (punti per evento)</div>
+      <div class="weight-row">
+        <span>Gol fatto</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="gol" value="3" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Assist</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="assist" value="1" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Ammonizione</span>
+        <input type="number" step="0.25" class="bonus-input" data-bonus="ammonizione" value="-0.5" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Rigore parato (P)</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="rigoreParato" value="3" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Porta inviolata (P/D)</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="cleanSheet" value="1" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Gol subito (P)</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="golSubito" value="-1" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Rigore sbagliato</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="rigoreSbagliato" value="-3" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Espulsione</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="espulsione" value="-1" style="width:60px;">
+      </div>
+      <div class="weight-row">
+        <span>Player of the Match</span>
+        <input type="number" step="0.5" class="bonus-input" data-bonus="potm" value="1" style="width:60px;">
+      </div>
+      <div class="ai-hint">Valori standard "Classic". Modificali se la tua lega usa regole diverse (es. Mantra).</div>
+    </div>
+
+    <div class="pitch" id="pitch">
+      <div class="pitch-box-top"></div>
+      <div class="pitch-box-bottom"></div>
+      <!-- rows injected by JS -->
+    </div>
+
+    <div class="bench-title">Panchina consigliata (ordine di priorità)</div>
+    <div class="bench-list" id="benchList"></div>
+
+    <div class="bench-title" id="unavailableTitle" style="display:none;">Indisponibili (esclusi dalla formazione)</div>
+    <div class="bench-list" id="unavailableList"></div>
+
+    <div class="weights-box" style="margin-top:16px;">
+      <div class="weights-title">Storico formazioni</div>
+      <button class="submit-btn" id="saveHistoryBtn" style="margin-bottom:10px;">💾 Salva questa formazione nello storico</button>
+      <div id="historyList"></div>
+      <div class="ai-hint">Salva l'undici schierato con il punteggio atteso; dopo la giornata apri "Voti per giocatore" in ogni riga e inserisci il voto fantacalcio reale (voto+bonus/malus effettivi, es. 8 per un gol con voto 6.5+1 assist ecc.) di ciascun titolare, oltre (facoltativo) al totale squadra. Con qualche giornata di dati, la sezione "scarto medio per ruolo" qui sotto mostra se stai sovra/sottostimando sistematicamente un ruolo, così puoi correggere i pesi o i bonus/malus custom qui sopra.</div>
+    </div>
+  </section>
+
+  <div class="footnote">I dati restano salvati su questo dispositivo. Usa "Aggiorna con AI" per cercare titolarità e ballottaggi aggiornati dal web, oppure modificali tu manualmente.</div>
+</div>
+
+<div class="picker-backdrop" id="pickerBackdrop">
+  <div class="picker-sheet">
+    <h3 id="pickerTitle">Scegli giocatore</h3>
+    <div id="pickerOptions"></div>
+    <button class="picker-close" id="pickerClose">Annulla</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const ROLE_LABEL = {P:'Portiere', D:'Difensore', C:'Centrocampista', A:'Attaccante'};
+  const STATUS_LABEL = {
+    titolare:'Titolare', ballottaggio:'Ballottaggio', panchina:'Panchina',
+    infortunato:'Infortunato', squalificato:'Squalificato'
+  };
+  const MODULES = {
+    '3-4-3':[3,4,3], '3-5-2':[3,5,2], '4-3-3':[4,3,3],
+    '4-4-2':[4,4,2], '4-5-1':[4,5,1], '5-3-2':[5,3,2], '5-4-1':[5,4,1]
+  };
+  const DIFF_LABEL = { facile:'Facile', media:'Media', difficile:'Difficile' };
+
+  // Statistiche squadra basate su GOL ATTESI (xG/xGA), non gol reali: xG
+  // misura la qualità delle occasioni create/concesse (tiro per tiro) ed è
+  // MOLTO meno rumoroso dei gol effettivi su campioni piccoli come le prime
+  // 3-4 giornate (un tiro deviato o un portiere in giornata no non lo
+  // spostano quanto sposterebbero i gol reali). g=partite giocate.
+  // Fonte: oddalerts.com/xg/serie-a (dati Opta), aggiornata al 13/09/2026,
+  // 4ª giornata. Da aggiornare ogni 3-4 giornate ricopiando xg/xga da lì.
+  let TEAM_XG_STATS = {
+    'Lazio':      { g:4, xg:5.52, xga:5.30 },
+    'Roma':       { g:3, xg:8.90, xga:2.10 },
+    'Inter':      { g:3, xg:8.87, xga:3.59 },
+    'Cagliari':   { g:4, xg:4.24, xga:6.61 },
+    'Milan':      { g:4, xg:6.53, xga:5.36 },
+    'Como':       { g:3, xg:4.82, xga:4.64 },
+    'Juventus':   { g:3, xg:4.97, xga:0.98 },
+    'Frosinone':  { g:4, xg:5.49, xga:8.31 },
+    'Atalanta':   { g:4, xg:3.72, xga:7.72 },
+    'Sassuolo':   { g:3, xg:6.16, xga:4.36 },
+    'Udinese':    { g:3, xg:3.69, xga:5.32 },
+    'Napoli':     { g:3, xg:4.71, xga:6.17 },
+    'Torino':     { g:3, xg:3.09, xga:6.17 },
+    'Lecce':      { g:3, xg:3.54, xga:6.04 },
+    'Fiorentina': { g:4, xg:7.13, xga:6.16 },
+    'Bologna':    { g:3, xg:5.44, xga:2.39 },
+    'Parma':      { g:3, xg:2.28, xga:4.28 },
+    'Monza':      { g:3, xg:4.11, xga:3.39 },
+    'Genoa':      { g:4, xg:4.20, xga:5.80 },
+    'Venezia':    { g:4, xg:6.10, xga:8.82 }
+  };
+
+  // Indice ATTACCO e DIFESA per squadra = scostamento di xG fatti/xG concessi
+  // a partita rispetto alla media di campionato, "blendato" con i gol REALI
+  // della scorsa stagione (shrinkage bayesiano, vedi sotto — le unità sono
+  // entrambe "gol/gol attesi a partita", quindi comparabili anche se non
+  // identiche) per stabilizzare ulteriormente il piccolo campione di inizio
+  // stagione: un attaccante viene reso più difficile dalla DIFESA
+  // dell'avversario, un difensore/portiere dall'ATTACCO dell'avversario.
+  //
+  // Statistiche finali Serie A 2025/26 (38 partite, gol reali, fonte
+  // laseriea.org), usate SOLO come prior. Mancano volutamente Frosinone,
+  // Monza e Venezia: sono neopromosse, l'anno scorso hanno giocato in Serie
+  // B (dati non comparabili), quindi per loro si usa solo lo xG di quest'anno.
+  const LAST_SEASON_STATS = {
+    'Inter':      { g:38, gf:89, gs:35 },
+    'Napoli':     { g:38, gf:58, gs:36 },
+    'Roma':       { g:38, gf:59, gs:31 },
+    'Como':       { g:38, gf:65, gs:29 },
+    'Milan':      { g:38, gf:53, gs:35 },
+    'Juventus':   { g:38, gf:61, gs:34 },
+    'Atalanta':   { g:38, gf:51, gs:36 },
+    'Bologna':    { g:38, gf:49, gs:46 },
+    'Lazio':      { g:38, gf:41, gs:40 },
+    'Udinese':    { g:38, gf:45, gs:48 },
+    'Sassuolo':   { g:38, gf:46, gs:50 },
+    'Torino':     { g:38, gf:44, gs:63 },
+    'Parma':      { g:38, gf:28, gs:46 },
+    'Cagliari':   { g:38, gf:40, gs:53 },
+    'Fiorentina': { g:38, gf:41, gs:50 },
+    'Genoa':      { g:38, gf:41, gs:51 },
+    'Lecce':      { g:38, gf:28, gs:50 }
+  };
+  // Split casa/trasferta REALE della Serie A 2025/26 (19 partite in casa e
+  // 19 in trasferta per squadra, fonte soccerstats.com/widetable). Usato
+  // come prior anche per lo split di quest'anno: stesso principio dello
+  // shrinkage sopra, ma applicato separatamente a casa e trasferta, così lo
+  // split entra in gioco da subito (pesato sul prior) invece di aspettare
+  // 5 partite vere nel campo prima di attivarsi.
+  const LAST_SEASON_VENUE_STATS = {
+    'Inter':      { home:{g:19,gf:50,gs:16}, away:{g:19,gf:39,gs:19} },
+    'Napoli':     { home:{g:19,gf:33,gs:18}, away:{g:19,gf:25,gs:18} },
+    'Roma':       { home:{g:19,gf:33,gs:10}, away:{g:19,gf:26,gs:21} },
+    'Como':       { home:{g:19,gf:35,gs:15}, away:{g:19,gf:30,gs:14} },
+    'Milan':      { home:{g:19,gf:25,gs:21}, away:{g:19,gf:28,gs:14} },
+    'Juventus':   { home:{g:19,gf:35,gs:16}, away:{g:19,gf:26,gs:18} },
+    'Atalanta':   { home:{g:19,gf:25,gs:15}, away:{g:19,gf:26,gs:21} },
+    'Bologna':    { home:{g:19,gf:19,gs:23}, away:{g:19,gf:30,gs:23} },
+    'Lazio':      { home:{g:19,gf:27,gs:25}, away:{g:19,gf:14,gs:15} },
+    'Udinese':    { home:{g:19,gf:18,gs:21}, away:{g:19,gf:27,gs:27} },
+    'Sassuolo':   { home:{g:19,gf:25,gs:26}, away:{g:19,gf:21,gs:24} },
+    'Torino':     { home:{g:19,gf:27,gs:29}, away:{g:19,gf:17,gs:34} },
+    'Parma':      { home:{g:19,gf:16,gs:25}, away:{g:19,gf:12,gs:21} },
+    'Cagliari':   { home:{g:19,gf:22,gs:23}, away:{g:19,gf:18,gs:30} },
+    'Fiorentina': { home:{g:19,gf:21,gs:21}, away:{g:19,gf:20,gs:29} },
+    'Genoa':      { home:{g:19,gf:22,gs:26}, away:{g:19,gf:19,gs:25} },
+    'Lecce':      { home:{g:19,gf:13,gs:24}, away:{g:19,gf:15,gs:26} }
+  };
+  // Peso del prior in "partite equivalenti": 6 partite di storico contano
+  // quanto 6 partite di stagione attuale. Con G partite giocate quest'anno,
+  // il peso del prior è quindi 6/(6+G) — scende da solo mano a mano che si
+  // aggiornano i numeri di TEAM_XG_STATS ogni 3-4 giornate, senza bisogno di
+  // toccare questa formula.
+  const PRIOR_SEASON_WEIGHT_GAMES = 6;
+
+  let TEAM_ATTACK = {}, TEAM_DEFENSE = {};
+  let TEAM_ATTACK_HOME = {}, TEAM_DEFENSE_HOME = {}, TEAM_ATTACK_AWAY = {}, TEAM_DEFENSE_AWAY = {};
+  // Tassi "gol/gol attesi a partita" già blendati (xG corrente + prior storico),
+  // esposti qui (oltre agli indici atk/def centrati sulla media) perché servono
+  // anche al modello di gol attesi subiti (computeGoalsConcededStat) e alla
+  // tabella statistiche in UI. LEAGUE_AVG_* = media di campionato dello stesso
+  // insieme di squadre usate per calcolarli (generale, o solo casa/trasferta).
+  let TEAM_PERGAME = {}, TEAM_PERGAME_HOME = {}, TEAM_PERGAME_AWAY = {};
+  let LEAGUE_AVG_GF = 0, LEAGUE_AVG_GS = 0, LEAGUE_AVG_GF_HOME = null, LEAGUE_AVG_GF_AWAY = null;
+  let teamXgLastUpdate = null; // ISO string, per mostrare "aggiornato Xh fa" in UI
+
+  // ---------- xG per GIOCATORE (stesso principio dello shrinkage di squadra) ----------
+  // L'AI (con web search) recupera per ogni giocatore in rosa lo xG/90' della
+  // stagione corrente e, quando disponibile, lo xG/90' della stagione Serie A
+  // precedente come prior. Qui li mescoliamo con uno shrinkage bayesiano
+  // pesato sui MINUTI (equivalente a quello pesato sulle partite usato per le
+  // squadre): con pochi minuti giocati quest'anno pesa di più il prior
+  // storico, che scompare da solo mano a mano che si accumula minutaggio
+  // reale nella stagione in corso. Persistito in locale (Store) così non va
+  // richiesto da zero ad ogni aggiornamento, ma solo raffinato.
+  // key = normalizeName(nome giocatore) -> { xg90, minutes, xg90Prev, minutesPrev, lastUpdate }
+  let PLAYER_XG_STATS = {};
+  // Peso del prior in "minuti equivalenti": ~3 partite da titolare. Stessa
+  // logica di PRIOR_SEASON_WEIGHT_GAMES ma su minuti invece che partite,
+  // perché il campione di un giocatore si misura meglio in minuti giocati
+  // che in presenze (subentri, infortuni, ecc. rendono le partite disomogenee).
+  const PLAYER_PRIOR_WEIGHT_MINUTES = 270;
+  // Sotto questa soglia di minuti giocati LA STAGIONE SCORSA, il dato xG/90
+  // di quella stagione è troppo rumoroso per fare da prior affidabile (es.
+  // un giocatore con 3 spezzoni da 10') e viene ignorato piuttosto che
+  // introdurre un prior fuorviante.
+  const MIN_PREV_MINUTES_FOR_PRIOR = 450;
+
+  // Sotto questa soglia di partite giocate in un dato campo (casa o
+  // trasferta) senza uno storico comparabile (LAST_SEASON_VENUE_STATS) NON
+  // si usa lo split per quella squadra — vale solo per le neopromosse, che
+  // non hanno un anno scorso in Serie A da usare come prior.
+  const MIN_VENUE_GAMES_FOR_SPLIT = 5;
+
+  function recomputeTeamRatings(){
+    const teams = Object.keys(TEAM_XG_STATS);
+    const perGame = {};
+    teams.forEach(t=>{
+      const cur = TEAM_XG_STATS[t];
+      const prior = LAST_SEASON_STATS[t];
+      if(prior){
+        const priorGFpg = prior.gf/prior.g, priorGSpg = prior.gs/prior.g;
+        const K = PRIOR_SEASON_WEIGHT_GAMES;
+        perGame[t] = {
+          gfpg: (cur.xg + K*priorGFpg) / (cur.g + K),
+          gspg: (cur.xga + K*priorGSpg) / (cur.g + K)
+        };
+      } else {
+        // Neopromossa: nessun prior comparabile, solo xG della stagione in corso.
+        perGame[t] = { gfpg: cur.xg/cur.g, gspg: cur.xga/cur.g };
+      }
+    });
+    let sumGFpg = 0, sumGSpg = 0;
+    teams.forEach(t=>{ sumGFpg += perGame[t].gfpg; sumGSpg += perGame[t].gspg; });
+    const avgGF = sumGFpg/teams.length, avgGS = sumGSpg/teams.length;
+    const atk = {}, def = {};
+    teams.forEach(t=>{
+      atk[t] = perGame[t].gfpg - avgGF;  // positivo = attacco sopra la media
+      def[t] = avgGS - perGame[t].gspg;  // positivo = difesa sopra la media (subisce meno)
+    });
+    TEAM_ATTACK = atk;
+    TEAM_DEFENSE = def;
+    TEAM_PERGAME = perGame;
+    LEAGUE_AVG_GF = avgGF; LEAGUE_AVG_GS = avgGS;
+
+    // Split casa/trasferta: stesso shrinkage bayesiano di sopra ma applicato
+    // separatamente per campo, usando lo storico REALE casa/trasferta
+    // 2025/26 come prior. Il confronto è contro la media di campionato DELLO
+    // STESSO CAMPO (le squadre segnano di più in casa in generale, va
+    // confrontato con la media "in casa", non con la media generale). Le
+    // neopromosse (senza prior) entrano solo dopo MIN_VENUE_GAMES_FOR_SPLIT
+    // partite reali in quel campo.
+    function buildVenueRatings(gField, xgField, xgaField, venueKey){
+      const perGameV = {};
+      const eligible = [];
+      teams.forEach(t=>{
+        const cur = TEAM_XG_STATS[t];
+        const curG = cur[gField] || 0;
+        const curXg = cur[xgField] || 0;
+        const curXga = cur[xgaField] || 0;
+        const priorVenue = LAST_SEASON_VENUE_STATS[t] && LAST_SEASON_VENUE_STATS[t][venueKey];
+        if(priorVenue){
+          const K = PRIOR_SEASON_WEIGHT_GAMES;
+          const priorGFpg = priorVenue.gf/priorVenue.g, priorGSpg = priorVenue.gs/priorVenue.g;
+          perGameV[t] = {
+            gfpg: (curXg + K*priorGFpg) / (curG + K),
+            gspg: (curXga + K*priorGSpg) / (curG + K)
+          };
+          eligible.push(t);
+        } else if(curG >= MIN_VENUE_GAMES_FOR_SPLIT){
+          // Neopromossa con abbastanza partite reali in questo campo.
+          perGameV[t] = { gfpg: curXg/curG, gspg: curXga/curG };
+          eligible.push(t);
+        }
+      });
+      if(eligible.length < 2) return { atk:{}, def:{}, perGame:{}, avgGF:null }; // troppo poche squadre con dati sufficienti
+      let sGF=0, sGS=0;
+      eligible.forEach(t=>{ sGF += perGameV[t].gfpg; sGS += perGameV[t].gspg; });
+      const aGF = sGF/eligible.length, aGS = sGS/eligible.length;
+      const a={}, d={};
+      eligible.forEach(t=>{ a[t] = perGameV[t].gfpg - aGF; d[t] = aGS - perGameV[t].gspg; });
+      return { atk:a, def:d, perGame:perGameV, avgGF:aGF };
+    }
+    const home = buildVenueRatings('gHome','xgHome','xgaHome','home');
+    const away = buildVenueRatings('gAway','xgAway','xgaAway','away');
+    TEAM_ATTACK_HOME = home.atk; TEAM_DEFENSE_HOME = home.def;
+    TEAM_ATTACK_AWAY = away.atk; TEAM_DEFENSE_AWAY = away.def;
+    TEAM_PERGAME_HOME = home.perGame; TEAM_PERGAME_AWAY = away.perGame;
+    LEAGUE_AVG_GF_HOME = home.avgGF; LEAGUE_AVG_GF_AWAY = away.avgGF;
+  }
+  recomputeTeamRatings();
+
+  // xG/90' "vero" del giocatore: media pesata tra la stagione corrente (peso
+  // = minuti giocati finora) e il prior della stagione scorsa (peso fisso
+  // PLAYER_PRIOR_WEIGHT_MINUTES) — stessa formula di shrinkage usata sopra
+  // per le squadre, solo con minuti al posto di partite. Ritorna null se non
+  // c'è nessun dato utilizzabile (giocatore mai aggiornato dall'AI, o 0
+  // minuti sia quest'anno che l'anno scorso).
+  function blendPlayerXg90(stats){
+    if(!stats) return null;
+    const curMin = stats.minutes || 0;
+    const hasPrior = typeof stats.xg90Prev === 'number' && (stats.minutesPrev||0) >= MIN_PREV_MINUTES_FOR_PRIOR;
+    if(curMin <= 0){
+      // Nessun minuto quest'anno (es. infortunio lungo, neo-acquisto non ancora
+      // esordito): l'unico dato disponibile è il prior, se c'è.
+      return hasPrior ? stats.xg90Prev : (typeof stats.xg90==='number' ? stats.xg90 : null);
+    }
+    if(typeof stats.xg90 !== 'number') return hasPrior ? stats.xg90Prev : null;
+    if(!hasPrior) return stats.xg90; // nessun prior comparabile: xG di quest'anno così com'è
+    const K = PLAYER_PRIOR_WEIGHT_MINUTES;
+    return (stats.xg90*curMin + stats.xg90Prev*K) / (curMin + K);
+  }
+
+  // Minuti attesi nella prossima partita, stimati dalla probabilità di
+  // titolarità che l'AI restituisce (0-100): un titolare "sicuro" non fa mai
+  // 90' pieni in media (cambi, recuperi), un giocatore infortunato/squalificato
+  // ha 0 minuti attesi indipendentemente da qualsiasi probabilità residua.
+  const EXPECTED_MINUTES_IF_STARTER = 85;
+  function estimatedMinutesNextMatch(p){
+    if(p.status==='infortunato' || p.status==='squalificato') return 0;
+    const prob = (typeof p.titolaritaProb==='number') ? p.titolaritaProb
+      : (p.status==='titolare' ? 85 : p.status==='ballottaggio' ? 45 : p.status==='panchina' ? 10 : 0);
+    return clampNum(prob/100 * EXPECTED_MINUTES_IF_STARTER, 0, EXPECTED_MINUTES_IF_STARTER, 0);
+  }
+
+  // Probabilità di segnare ALMENO un gol, calcolata in autonomia (nessun
+  // input dall'AI oltre ai dati grezzi xG90/minuti) con un modello di Poisson:
+  // lambda = tasso di gol atteso nei minuti che il giocatore probabilmente
+  // giocherà, P(>=1 gol) = 1 - e^-lambda. Ritorna null se non c'è ancora
+  // nessun dato xG per quel giocatore (mai passato per un aggiornamento AI).
+  function computePGolStat(p){
+    const stats = PLAYER_XG_STATS[normalizeName(p.name)];
+    const xg90 = blendPlayerXg90(stats);
+    if(xg90 == null) return null;
+    const minutes = estimatedMinutesNextMatch(p);
+    if(minutes <= 0) return 0;
+    const lambda = (xg90/90) * minutes;
+    return (1 - Math.exp(-lambda)) * 100;
+  }
+
+  function normalizeTeamName(s){
+    return (s||'').toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // via accenti
+      .replace(/[^a-z0-9]/g,'');
+  }
+  const TEAM_NAME_NORM = Object.keys(TEAM_XG_STATS).reduce((acc,k)=>{ acc[normalizeTeamName(k)] = k; return acc; }, {});
+
+  function resolveTeamKey(name){
+    const norm = normalizeTeamName(name);
+    if(!norm) return null;
+    if(TEAM_NAME_NORM[norm]) return TEAM_NAME_NORM[norm];
+    const k = Object.keys(TEAM_NAME_NORM).find(nk=> norm.startsWith(nk) || nk.startsWith(norm));
+    return k ? TEAM_NAME_NORM[k] : null;
+  }
+
+  // Estrae dal campo libero "opponent" il nome della squadra avversaria e se
+  // la partita è in casa o trasferta. Il formato "canonico" prodotto dal
+  // prompt AI è "vs Cagliari (trasf.) — lun 7/9 h18:30", ma qui siamo
+  // volutamente TOLLERANTI verso varianti (l'AI a volte non segue il
+  // template alla lettera, es. "Cagliari, trasferta, lun 7/9"): niente "vs"
+  // richiesto, e casa/trasferta riconosciuti ovunque nella stringa, non solo
+  // tra parentesi subito dopo il nome. Questo evita che una singola
+  // formulazione diversa faccia sparire il calcolo automatico della difficoltà.
+  function parseOpponentInfo(str){
+    if(!str) return null;
+    const s = str.trim();
+    if(!s) return null;
+    let rest = s;
+    const prefixMatch = s.match(/^(?:vs\.?|contro)\s+/i);
+    if(prefixMatch) rest = s.slice(prefixMatch[0].length);
+    // Il nome squadra è tutto ciò che precede la prima parentesi, virgola,
+    // trattino/dash separatore, o la parola casa/trasferta.
+    const cutRe = /[(,–—]|\s-\s|\bin\s+(?:casa|trasferta)\b|\bcasa\b|\btrasferta\b/i;
+    const cutMatch = rest.match(cutRe);
+    let team = (cutMatch ? rest.slice(0, cutMatch.index) : rest).trim();
+    team = team.replace(/^(il|lo|la|i|gli|le)\s+/i, '').trim(); // "contro il Milan" -> "Milan"
+    if(!team) return null;
+    let isHome = null;
+    if(/\bcasa\b/i.test(s)) isHome = true;
+    else if(/\btrasf(erta)?\b/i.test(s)) isHome = false;
+    return { team, isHome };
+  }
+
+  // Calcola la difficoltà OGGETTIVA della partita, differenziata per ruolo:
+  // per un attaccante/centrocampista conta la DIFESA dell'avversario, per un
+  // portiere/difensore conta l'ATTACCO dell'avversario (non più un unico
+  // indice di forza generico uguale per tutti). Per il vantaggio casa/
+  // trasferta usa lo split REALE per squadra quando ce n'è abbastanza
+  // (MIN_VENUE_GAMES_FOR_SPLIT partite in quel campo), altrimenti ricade su
+  // un vantaggio-casa generico uguale per tutti — quindi si auto-attiva da
+  // solo team per team man mano che si accumulano partite, senza bisogno di
+  // toccare il codice.
+  // Ritorna un numero continuo (fino a ±14 nei mismatch più estremi) oppure
+  // null se non riesce a identificare con certezza le due squadre (allora si
+  // usa il fallback manuale in getExpectedComponents).
+  const HOME_ADV = 0.28; // gol/partita equivalenti di vantaggio-casa generico, stima standard (fallback)
+  const DIFF_SCALE = 9;  // scala l'indice atk/def (~-1.3..+1.9) sull'intervallo di punteggio (~-14..+14)
+  function computeObjectiveDifficulty(p){
+    const ownKey = resolveTeamKey(p.team);
+    const parsed = parseOpponentInfo(p.opponent);
+    if(!ownKey || !parsed) return null;
+    const oppKey = resolveTeamKey(parsed.team);
+    if(!oppKey) return null;
+    const isDefensiveRole = (p.role==='P' || p.role==='D');
+    let oppThreat;
+    // Se il giocatore gioca in trasferta, l'avversario gioca in casa: uso lo
+    // split "in casa" dell'avversario se disponibile. Viceversa per il caso opposto.
+    const splitAtk = parsed.isHome===true ? TEAM_ATTACK_AWAY : (parsed.isHome===false ? TEAM_ATTACK_HOME : null);
+    const splitDef = parsed.isHome===true ? TEAM_DEFENSE_AWAY : (parsed.isHome===false ? TEAM_DEFENSE_HOME : null);
+    const splitValue = isDefensiveRole ? splitAtk?.[oppKey] : splitDef?.[oppKey];
+    if(splitValue !== undefined && splitValue !== null){
+      oppThreat = splitValue; // già specifico per casa/trasferta, nessun aggiustamento generico da aggiungere
+    } else {
+      oppThreat = isDefensiveRole ? TEAM_ATTACK[oppKey] : TEAM_DEFENSE[oppKey];
+      // Se il giocatore gioca in trasferta, l'avversario è "in casa" quindi più
+      // pericoloso (+HOME_ADV); se gioca in casa, l'avversario è sminuito (-HOME_ADV).
+      if(parsed.isHome===true) oppThreat -= HOME_ADV;
+      else if(parsed.isHome===false) oppThreat += HOME_ADV;
+    }
+    // oppThreat alto = avversario minaccioso per questo ruolo = partita difficile = diffAdj negativo.
+    return clampNum(-oppThreat * DIFF_SCALE, -14, 14, 0);
+  }
+
+  // Stima statistica (nessun input AI, solo i tassi xG blendati già calcolati
+  // da recomputeTeamRatings) dei GOL ATTESI SUBITI dalla squadra del
+  // giocatore in QUESTA partita: modello moltiplicativo standard (la stessa
+  // logica dei modelli "Poisson bivariati" usati in letteratura per le
+  // previsioni di risultato) — quanto la propria squadra concede in media
+  // (blendato con lo storico) corretto per quanto è forte l'attacco
+  // avversario rispetto alla media di campionato. Usa lo split casa/
+  // trasferta quando disponibile per ENTRAMBE le squadre coinvolte,
+  // altrimenti ricade sui rating generali con un piccolo aggiustamento
+  // vantaggio-casa generico. Ritorna null se non identifica le due squadre o
+  // se non c'è ancora abbastanza dato xG di squadra.
+  function computeGoalsConcededStat(p){
+    const ownKey = resolveTeamKey(p.team);
+    const parsed = parseOpponentInfo(p.opponent);
+    if(!ownKey || !parsed) return null;
+    const oppKey = resolveTeamKey(parsed.team);
+    if(!oppKey) return null;
+    let ownGSpg, oppGFpg, avgGF;
+    if(parsed.isHome===true && TEAM_PERGAME_HOME[ownKey] && TEAM_PERGAME_AWAY[oppKey]){
+      ownGSpg = TEAM_PERGAME_HOME[ownKey].gspg;
+      oppGFpg = TEAM_PERGAME_AWAY[oppKey].gfpg;
+      avgGF = LEAGUE_AVG_GF_AWAY;
+    } else if(parsed.isHome===false && TEAM_PERGAME_AWAY[ownKey] && TEAM_PERGAME_HOME[oppKey]){
+      ownGSpg = TEAM_PERGAME_AWAY[ownKey].gspg;
+      oppGFpg = TEAM_PERGAME_HOME[oppKey].gfpg;
+      avgGF = LEAGUE_AVG_GF_HOME;
+    } else {
+      if(!TEAM_PERGAME[ownKey] || !TEAM_PERGAME[oppKey]) return null;
+      ownGSpg = TEAM_PERGAME[ownKey].gspg;
+      oppGFpg = TEAM_PERGAME[oppKey].gfpg;
+      avgGF = LEAGUE_AVG_GF;
+      if(parsed.isHome===true) oppGFpg -= HOME_ADV;
+      else if(parsed.isHome===false) oppGFpg += HOME_ADV;
+    }
+    if(!avgGF) return null;
+    const lambda = ownGSpg * (Math.max(0.1, oppGFpg) / avgGF);
+    return clampNum(lambda, 0, 6, null);
+  }
+
+
+  // Dati aggiornati al 4 settembre 2026 — 3ª giornata Serie A (4-7 settembre)
+  const DEFAULT_ROSTER = [
+    {name:'Falcone', role:'P', team:'Lecce', opponent:'vs Cagliari (trasf.) — lun 7/9 h18:30', status:'titolare', difficulty:'media', note:'Lecce squadra che subisce più tiri del campionato; Cagliari è la miglior difesa'},
+    {name:'Maignan', role:'P', team:'Milan', opponent:'vs Juventus (trasf.) — dom 6/9 h20:45', status:'titolare', difficulty:'difficile', note:'Big match: Juve ancora imbattuta e senza gol subiti in 2 giornate'},
+    {name:'Torriani', role:'P', team:'Milan', opponent:'vs Juventus (trasf.)', status:'panchina', difficulty:'difficile', note:'Riserva di Maignan'},
+    {name:'Mancini', role:'D', team:'Roma', opponent:'vs Atalanta (casa) — sab 5/9 h20:45', status:'titolare', difficulty:'media', note:''},
+    {name:'Wesley', role:'D', team:'Roma', opponent:'vs Atalanta (casa) — sab 5/9 h20:45', status:'titolare', difficulty:'media', note:''},
+    {name:'Gabbia', role:'D', team:'Milan', opponent:'vs Juventus (trasf.) — dom 6/9 h20:45', status:'ballottaggio', difficulty:'difficile', note:'"Non al meglio": De Winter avanti nelle gerarchie'},
+    {name:'Miranda J.', role:'D', team:'Bologna', opponent:'vs Sassuolo (casa) — dom 6/9 h18', status:'ballottaggio', difficulty:'media', note:'Ballottaggio con Alhassane sulla fascia sinistra'},
+    {name:'Badiashile', role:'D', team:'Napoli', opponent:'vs Inter (trasf.) — sab 5/9 h18', status:'panchina', difficulty:'difficile', note:'Nessun infortunio ma ritardo di condizione: partono Rrahmani-Marin'},
+    {name:'Diego Carlos', role:'D', team:'Parma', opponent:'vs Monza (casa) — dom 6/9 h15', status:'titolare', difficulty:'facile', note:'Lieve ballottaggio con Drobnic, ma favorito'},
+    {name:'Ramón', role:'D', team:'Como', opponent:'vs Genoa (trasf.) — ven 4/9 h20:45 OGGI', status:'titolare', difficulty:'media', note:''},
+    {name:'Lucumí', role:'D', team:'Juventus', opponent:'vs Milan (casa) — dom 6/9 h20:45', status:'titolare', difficulty:'difficile', note:'Favorito 60%-40% su Kelly'},
+    {name:'Conceição', role:'C', team:'Juventus', opponent:'vs Milan (casa) — dom 6/9 h20:45', status:'titolare', difficulty:'difficile', note:''},
+    {name:'Pulisic', role:'C', team:'Milan', opponent:'vs Juventus (trasf.) — dom 6/9 h20:45', status:'ballottaggio', difficulty:'difficile', note:'Alternativa a Cissé/Saelemaekers, non certo del posto'},
+    {name:'Orsolini', role:'C', team:'Bologna', opponent:'vs Sassuolo (casa) — dom 6/9 h18', status:'infortunato', difficulty:'media', note:'Lesione flessore: salta Sassuolo, Napoli e Torino (~3 settimane)'},
+    {name:'Alajbegovic', role:'C', team:'Juventus', opponent:'vs Milan (casa) — dom 6/9 h20:45', status:'panchina', difficulty:'difficile', note:'Dietro a Nico Gonzalez e Boga nelle gerarchie'},
+    {name:'Lobotka', role:'C', team:'Napoli', opponent:'vs Inter (trasf.) — sab 5/9 h18', status:'titolare', difficulty:'difficile', note:''},
+    {name:'Bernabè', role:'C', team:'Parma', opponent:'vs Monza (casa) — dom 6/9 h15', status:'ballottaggio', difficulty:'facile', note:'Uscito per affaticamento in Coppa Italia, da valutare nelle ultime ore'},
+    {name:'Cristante', role:'C', team:'Roma', opponent:'vs Atalanta (casa) — sab 5/9 h20:45', status:'titolare', difficulty:'media', note:''},
+    {name:'Liberali', role:'C', team:'Como', opponent:'vs Genoa (trasf.) — ven 4/9 h20:45 OGGI', status:'panchina', difficulty:'media', note:'Parte dalla panchina'},
+    {name:'Hojlund', role:'A', team:'Napoli', opponent:'vs Inter (trasf.) — sab 5/9 h18', status:'titolare', difficulty:'difficile', note:''},
+    {name:'Laurientè', role:'A', team:'Sassuolo', opponent:'vs Bologna (trasf.) — dom 6/9 h18', status:'titolare', difficulty:'media', note:'Bologna senza Orsolini ma reparto offensivo integro'},
+    {name:'De Ketelaere', role:'A', team:'Atalanta', opponent:'vs Roma (trasf.) — sab 5/9 h20:45', status:'titolare', difficulty:'media', note:''},
+    {name:'Daniel Maldini', role:'A', team:'Cagliari', opponent:'vs Lecce (casa) — lun 7/9 h18:30', status:'titolare', difficulty:'facile', note:''},
+    {name:'Stulic', role:'A', team:'Lecce', opponent:'vs Cagliari (trasf.) — lun 7/9 h18:30', status:'titolare', difficulty:'media', note:'Cagliari miglior difesa del campionato per gol subiti'},
+    {name:'Yildiz', role:'A', team:'Juventus', opponent:'vs Milan (casa) — dom 6/9 h20:45', status:'infortunato', difficulty:'difficile', note:'Frattura V metatarso, operato: rientro previsto inizio dicembre'}
+  ];
+
+  let roster = [];
+  let formation = { module:'4-3-3', slots:{} }; // slots: { "D-0": playerId, "C-1": playerId, ... , "P-0": id }
+  // Pesi di default: valori CONSIGLIATI (non 1/1/1 neutro) per ridurre la
+  // tentazione di tararli a occhio finché non escono i giocatori che si
+  // preferisce. Titolarità pesa di più perché è un effetto soglia (zero
+  // minuti = zero qualsiasi altra cosa); difficoltà pesa meno perché il
+  // differenziale di forza è già parzialmente incorporato nella stima del
+  // fantavoto/eXG che arriva dall'AI, quindi pesarla troppo la conterebbe due volte.
+  let weights = { titolarita:1.5, forma:1, difficolta:0.5 }; // moltiplicatori 0-2 per il punteggio pesato
+  let weightsLocked = true;
+  let formationHistory = []; // [{id, date, module, totalExpected, players:[{name,role,expected,real}], realPoints}]
+  // Tiene traccia di quali menu a tendina "Voti per giocatore"/"Voti riserve"
+  // sono aperti, per ripristinarli dopo ogni renderHistory() (che ricostruisce
+  // l'HTML da zero a ogni voto inserito e altrimenti li richiuderebbe tutti).
+  const historyOpenState = {};
+  let activeRoleFilter = 'TUTTI';
+  let currentPickerSlotKey = null;
+
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+  function uid(){ return 'p_' + Math.random().toString(36).slice(2,10); }
+
+  // ---------- storage (artifact window.storage OR standalone localStorage) ----------
+  const hasArtifactStorage = (typeof window !== 'undefined') && !!window.storage;
+  const Store = {
+    async get(key){
+      if(hasArtifactStorage){
+        try{ const r = await window.storage.get(key, false); return r ? r.value : null; }
+        catch(e){ return null; }
+      }
+      try{ return localStorage.getItem(key); }catch(e){ return null; }
+    },
+    async set(key, value){
+      if(hasArtifactStorage){
+        try{ await window.storage.set(key, value, false); return true; }
+        catch(e){ return false; }
+      }
+      try{ localStorage.setItem(key, value); return true; }catch(e){ return false; }
+    }
+  };
+
+  // ---------- storage ----------
+  async function loadData(){
+    try{
+      const raw = await Store.get('fanta-roster');
+      if(raw && JSON.parse(raw).length){
+        roster = JSON.parse(raw);
+      }else{
+        roster = DEFAULT_ROSTER.map(p=>({...p, id: uid()}));
+        await saveRoster();
+      }
+    }catch(e){
+      roster = DEFAULT_ROSTER.map(p=>({...p, id: uid()}));
+      try{ await saveRoster(); }catch(e2){}
+    }
+    try{
+      const f = await Store.get('fanta-formation');
+      if(f) formation = JSON.parse(f);
+    }catch(e){ /* keep default */ }
+    try{
+      const w = await Store.get('fanta-weights');
+      if(w) Object.assign(weights, JSON.parse(w));
+    }catch(e){ /* keep default */ }
+    try{
+      const wl = await Store.get('fanta-weights-locked');
+      if(wl !== null && wl !== undefined) weightsLocked = JSON.parse(wl);
+    }catch(e){ /* keep default (locked) */ }
+    try{
+      const txg = await Store.get('fanta-team-xg-stats');
+      if(txg){
+        const parsed = JSON.parse(txg);
+        if(parsed && parsed.stats){
+          // Merge invece di sostituire: se in futuro aggiungo/tolgo squadre nel
+          // codice, non perdo le nuove solo perché non erano nel salvataggio vecchio.
+          Object.keys(parsed.stats).forEach(t=>{
+            if(TEAM_XG_STATS[t]) TEAM_XG_STATS[t] = parsed.stats[t];
+          });
+          teamXgLastUpdate = parsed.updatedAt || null;
+          recomputeTeamRatings();
+        }
+      }
+    }catch(e){ /* keep default (dati xG incorporati nel codice) */ }
+    try{
+      const pxg = await Store.get('fanta-player-xg-stats');
+      if(pxg){
+        const parsed = JSON.parse(pxg);
+        if(parsed && typeof parsed === 'object') PLAYER_XG_STATS = parsed;
+      }
+    }catch(e){ /* keep default (nessuno storico xG giocatori ancora) */ }
+    try{
+      const b = await Store.get('fanta-bonus-config');
+      if(b) Object.assign(FANTA_BONUS, JSON.parse(b));
+    }catch(e){ /* keep default */ }
+    try{
+      const h = await Store.get('fanta-history');
+      if(h) formationHistory = JSON.parse(h);
+    }catch(e){ /* keep default */ }
+    $$('.bonus-input').forEach(inp=>{
+      const key = inp.dataset.bonus;
+      if(typeof FANTA_BONUS[key] === 'number') inp.value = FANTA_BONUS[key];
+    });
+    render();
+  }
+  async function saveRoster(){
+    await Store.set('fanta-roster', JSON.stringify(roster));
+  }
+  async function saveFormation(){
+    await Store.set('fanta-formation', JSON.stringify(formation));
+  }
+  async function saveWeights(){
+    await Store.set('fanta-weights', JSON.stringify(weights));
+  }
+  async function saveWeightsLocked(){
+    await Store.set('fanta-weights-locked', JSON.stringify(weightsLocked));
+  }
+  async function saveTeamXgStats(){
+    await Store.set('fanta-team-xg-stats', JSON.stringify({ stats: TEAM_XG_STATS, updatedAt: teamXgLastUpdate }));
+  }
+  async function savePlayerXgStats(){
+    await Store.set('fanta-player-xg-stats', JSON.stringify(PLAYER_XG_STATS));
+  }
+  async function saveBonusConfig(){
+    await Store.set('fanta-bonus-config', JSON.stringify(FANTA_BONUS));
+  }
+  async function saveHistory(){
+    await Store.set('fanta-history', JSON.stringify(formationHistory));
+  }
+
+  // ---------- tabs ----------
+  $$('nav.tabs button').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      $$('nav.tabs button').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      $$('.panel').forEach(p=>p.classList.remove('active'));
+      $('#panel-'+btn.dataset.tab).classList.add('active');
+      if(btn.dataset.tab === 'formazione') renderPitch();
+    });
+  });
+
+  // ---------- role filter ----------
+  $('#roleFilter').addEventListener('click', (e)=>{
+    const btn = e.target.closest('button');
+    if(!btn) return;
+    $$('#roleFilter button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    activeRoleFilter = btn.dataset.role;
+    renderPlayerList();
+  });
+
+  // ---------- add form ----------
+  $('#addToggle').addEventListener('click', ()=>{
+    $('#addForm').classList.toggle('open');
+  });
+  $('#saveBtn').addEventListener('click', ()=>{
+    const name = $('#f-name').value.trim();
+    if(!name){ $('#f-name').focus(); return; }
+    const player = {
+      id: uid(),
+      name,
+      role: $('#f-role').value,
+      team: $('#f-team').value.trim(),
+      opponent: $('#f-opponent').value.trim(),
+      status: $('#f-status').value,
+      difficulty: $('#f-difficulty').value,
+      note: $('#f-note').value.trim()
+    };
+    roster.push(player);
+    saveRoster();
+    $('#f-name').value=''; $('#f-team').value=''; $('#f-opponent').value=''; $('#f-note').value='';
+    $('#f-status').value='titolare'; $('#f-role').value='P'; $('#f-difficulty').value='media';
+    $('#addForm').classList.remove('open');
+    render();
+  });
+
+  // ---------- player list ----------
+  function trendBadge(p){
+    const t = analyzeTrend(p);
+    if(!t) return '';
+    const dirIcon = { crescita:'📈', calo:'📉', stabile:'➖' }[t.direction];
+    const dirLabel = { crescita:'in crescita', calo:'in calo', stabile:'stabile' }[t.direction];
+    const warn = t.outOfTrend
+      ? ` · <span style="color:${t.deviation>0?'#4a9d5f':'#c0453f'};font-weight:700;">⚠️ ultimo voto ${t.deviation>0?'sopra':'sotto'} il trend (${t.last.toFixed(1)} vs media ${t.avgPrev.toFixed(1)})</span>`
+      : '';
+    return `<div class="player-note" style="font-style:normal;">${dirIcon} Trend ${dirLabel} · media ultime ${p.recentRatings.length}: ${t.avgAll.toFixed(1)}${warn}</div>`;
+  }
+
+  function freshnessClass(iso){
+    const h = (Date.now() - new Date(iso).getTime()) / 3600000;
+    if(h < 24) return 'fresh';
+    if(h < 72) return 'stale';
+    return 'old';
+  }
+
+  function renderPlayerList(){
+    const list = $('#playerList');
+    const filtered = activeRoleFilter==='TUTTI' ? roster : roster.filter(p=>p.role===activeRoleFilter);
+    if(filtered.length===0){
+      list.innerHTML = '<div class="empty-state">Nessun giocatore qui. Aggiungine uno dal pulsante sotto.</div>';
+      return;
+    }
+    const order = {P:0,D:1,C:2,A:3};
+    filtered.sort((a,b)=> order[a.role]-order[b.role] || a.name.localeCompare(b.name));
+    const fieldedDefMod = computeDefenseModifierForFormation(formation.slots);
+    list.innerHTML = filtered.map(p=>`
+      <div class="player-row" data-id="${p.id}" style="flex-wrap:wrap;">
+        <div class="role-chip ${p.role}">${p.role}</div>
+        <div class="player-info">
+          <div class="player-name">${escapeHtml(p.name)}${p.team? ' <span style="color:var(--ink-soft);font-weight:500;">· '+escapeHtml(p.team)+'</span>':''}</div>
+          <div class="player-meta">
+            <input type="text" data-field="opponent" placeholder="Prossimo avversario…" value="${escapeAttr(p.opponent||'')}">
+          </div>
+          ${p.note ? `<div class="player-note">${escapeHtml(p.note)}</div>` : ''}
+          ${(p.role==='P'||p.role==='D') && typeof p.cleanSheetProb==='number' ? `<div class="player-note" style="font-style:normal;">🧤 Porta inviolata: <b>${Math.round(p.cleanSheetProb)}%</b>${typeof p.shotsConcededAvg==='number' ? ` · ${p.shotsConcededAvg} tiri subiti/gara` : ''}${typeof p.cleanSheetAI==='number' && typeof p.cleanSheetStat==='number' ? ` <span style="color:var(--ink-soft);">(AI ${Math.round(p.cleanSheetAI)}% · xG ${Math.round(p.cleanSheetStat)}%)</span>` : ''}</div>` : ''}
+          ${p.role==='P' && typeof p.expectedGoalsConceded==='number' ? `<div class="player-note" style="font-style:normal;">🥅 Gol attesi subiti: <b>${p.expectedGoalsConceded.toFixed(2)}</b> <span style="color:var(--ink-soft);">(malus ~${(p.expectedGoalsConceded*FANTA_BONUS.golSubito).toFixed(2)} pt${typeof p.golSubitoAI==='number' && typeof p.golSubitoStat==='number' ? ` · AI ${p.golSubitoAI.toFixed(2)} · xG ${p.golSubitoStat.toFixed(2)}` : ''})</span></div>` : ''}
+          ${(p.role==='P'||p.role==='D') && Object.values(formation.slots).includes(p.id) && fieldedDefMod.avgVoto!=null ? `<div class="player-note" style="font-style:normal;">🛡️ Concorre al modificatore difesa di squadra: <b>${fieldedDefMod.modifier>=0?'+':''}${fieldedDefMod.modifier.toFixed(2)}</b> <span style="color:var(--ink-soft);">pt sommato una volta al totale squadra (media portiere + migliori 3 difensori: ${fieldedDefMod.avgVoto.toFixed(2)})</span></div>` : ''}
+          ${typeof p.pGol==='number' && (p.role==='A'||p.role==='C') ? `<div class="player-note" style="font-style:normal;">⚽ Prob. gol: <b>${Math.round(p.pGol)}%</b>${typeof p.pGolAI==='number' && typeof p.pGolStat==='number' ? ` <span style="color:var(--ink-soft);">(AI ${Math.round(p.pGolAI)}% · xG90 ${Math.round(p.pGolStat)}%)</span>` : ''}</div>` : ''}
+          ${p.rigorista && typeof p.pRigoreSbagliato==='number' ? `<div class="player-note" style="font-style:normal;">🎯 Rischio rigore sbagliato: <b>${Math.round(p.pRigoreSbagliato)}%</b></div>` : ''}
+          ${typeof p.pPotm==='number' && p.pPotm>=15 ? `<div class="player-note" style="font-style:normal;">⭐ Prob. Player of the Match: <b>${Math.round(p.pPotm)}%</b></div>` : ''}
+          ${p.rigorista ? `<div class="player-note" style="font-style:normal;">🎯 Rigorista/piazzati</div>` : ''}
+          ${(()=>{ const od = computeObjectiveDifficulty(p); return od!==null
+            ? `<div class="player-note" style="font-style:normal;">📊 Difficoltà calcolata: <b style="color:${od>=0?'#3f7a4a':'#c0453f'};">${od>=0?'+':''}${od.toFixed(1)}</b> <span style="color:var(--ink-soft);">(forza ${escapeHtml(p.team||'—')} vs ${escapeHtml(parseOpponentInfo(p.opponent)?.team||'')})</span></div>`
+            : `<div class="player-note" style="font-style:normal;color:var(--ink-soft);">📊 Difficoltà non calcolabile automaticamente (squadra/avversario non riconosciuti) — uso il valore manuale qui a destra.</div>`; })()}
+          ${trendBadge(p)}
+          ${p.lastUpdate ? `<div class="update-badge ${freshnessClass(p.lastUpdate)}">🔄 ${timeAgo(p.lastUpdate)}</div>` : ''}
+        </div>
+        <select class="status-select ${p.status}" data-field="status">
+          ${Object.keys(STATUS_LABEL).map(s=>`<option value="${s}" ${s===p.status?'selected':''}>${STATUS_LABEL[s]}</option>`).join('')}
+        </select>
+        <select class="status-select diff-badge ${p.difficulty||'media'}" data-field="difficulty" style="border:none;" title="Usato solo se la difficoltà non è calcolabile in automatico">
+          ${Object.keys(DIFF_LABEL).map(d=>`<option value="${d}" ${d===(p.difficulty||'media')?'selected':''}>${DIFF_LABEL[d]} (manuale)</option>`).join('')}
+        </select>
+        <button class="del-btn" data-action="delete" title="Rimuovi">✕</button>
+      </div>
+    `).join('');
+  }
+
+  $('#playerList').addEventListener('input', (e)=>{
+    const row = e.target.closest('.player-row');
+    if(!row) return;
+    const p = roster.find(x=>x.id===row.dataset.id);
+    if(!p) return;
+    if(e.target.dataset.field==='opponent'){
+      p.opponent = e.target.value;
+      saveRoster();
+    }
+  });
+  $('#playerList').addEventListener('change', (e)=>{
+    const row = e.target.closest('.player-row');
+    if(!row) return;
+    const p = roster.find(x=>x.id===row.dataset.id);
+    if(!p) return;
+    if(e.target.dataset.field==='status'){
+      p.status = e.target.value;
+      e.target.className = 'status-select ' + p.status;
+      saveRoster();
+      renderPitch();
+    }
+    if(e.target.dataset.field==='difficulty'){
+      p.difficulty = e.target.value;
+      e.target.className = 'status-select diff-badge ' + p.difficulty;
+      saveRoster();
+    }
+  });
+  $('#playerList').addEventListener('click', (e)=>{
+    if(e.target.dataset.action==='delete'){
+      const row = e.target.closest('.player-row');
+      const id = row.dataset.id;
+      roster = roster.filter(p=>p.id!==id);
+      for(const key in formation.slots){ if(formation.slots[key]===id) delete formation.slots[key]; }
+      saveRoster(); saveFormation();
+      render();
+    }
+  });
+
+  // ---------- punteggio pesato ----------
+  // Nota metodologica: per portieri e difensori la "difficoltà" categorica
+  // (facile/media/difficile) è un'etichetta soggettiva unica per squadra,
+  // applicata allo stesso modo a tutti i ruoli. Se disponibile, usiamo invece
+  // la probabilità di porta inviolata (clean sheet %, stimata da quote
+  // scommesse / xG concesso / tiri subiti dalla squadra): è un dato continuo
+  // e specifico per P/D, molto più preciso di un -8/0/+8 fisso.
+  // Bonus/malus standard fantacalcio classic (in punti), usati per calcolare
+  // il valore atteso reale invece di un indice arbitrario 0-3.
+  // Modificabile dall'utente (pannello "Bonus/malus personalizzati"), persistito su storage.
+  let FANTA_BONUS = { gol:3, assist:1, ammonizione:-0.5, rigoreParato:3, cleanSheet:1, golSubito:-1, rigoreSbagliato:-3, espulsione:-1, potm:1 };
+
+  // ---- Modificatore difesa (regola del TUO fantacalcio) ----
+  // NOTA: non dipende dalla squadra reale di appartenenza, ma dall'UNDICI CHE
+  // SCHIERI: si calcola sul portiere titolare + i migliori 3 difensori che
+  // metti in campo (se ne schieri 4, si scarta il voto più basso dei 4 e
+  // restano i migliori 3; se ne schieri 3, entrano tutti). La media dei 4 voti
+  // così ottenuti (1 portiere + 3 difensori) determina il bonus/malus, che
+  // viene poi applicato UNA SOLA VOLTA al punteggio TOTALE della squadra
+  // schierata in quella giornata (non sommato singolarmente a ciascun P/D:
+  // es. media 6.5 => +1.5 sommato una volta sola al totale, non +1.5 per
+  // ognuno dei difensori schierati).
+  //   media < 6.00        => 0
+  //   6.00 - 6.24         => +0.5
+  //   6.25 - 6.49         => +1
+  //   6.50 - 6.74         => +1.5
+  //   6.75 - 6.99         => +2
+  //   >= 7.00             => +2.5
+  function defenseModifierFromVoto(voto){
+    if(typeof voto !== 'number' || !isFinite(voto)) return 0;
+    if(voto < 6) return 0;
+    if(voto < 6.25) return 0.5;
+    if(voto < 6.5) return 1;
+    if(voto < 6.75) return 1.5;
+    if(voto < 7) return 2;
+    return 2.5;
+  }
+
+  // Calcola il modificatore di difesa per un dato undici schierato (slots).
+  // Ritorna { modifier, avgVoto, gkId, fieldedDefenderIds, countedDefenderIds }.
+  // Se manca il fantavotoAtteso del portiere o di tutti i difensori, il
+  // modificatore è 0 (dati insufficienti per stimarlo).
+  function computeDefenseModifierForFormation(slots){
+    const gkId = slots['P-0'];
+    const gk = gkId ? roster.find(x=>x.id===gkId) : null;
+    const gkVoto = gk && typeof gk.fantavotoAtteso==='number' ? gk.fantavotoAtteso : null;
+
+    const fieldedDefenders = Object.keys(slots)
+      .filter(k=>k.startsWith('D-'))
+      .map(k=>roster.find(x=>x.id===slots[k]))
+      .filter(Boolean);
+    const fieldedDefenderIds = fieldedDefenders.map(p=>p.id);
+
+    const withVoto = fieldedDefenders
+      .filter(p=>typeof p.fantavotoAtteso==='number')
+      .sort((a,b)=> b.fantavotoAtteso - a.fantavotoAtteso);
+    // Migliori 3: se ne hai schierati 4 (o più) si scarta/i il/i voto/i più
+    // basso/i, tenendo solo i migliori 3; se ne hai schierati 3, entrano tutti.
+    const countedDefenders = withVoto.slice(0,3);
+    const countedDefenderIds = countedDefenders.map(p=>p.id);
+
+    if(gkVoto===null || countedDefenders.length===0){
+      return { modifier:0, avgVoto:null, gkId, fieldedDefenderIds, countedDefenderIds };
+    }
+    const allVotes = [gkVoto, ...countedDefenders.map(p=>p.fantavotoAtteso)];
+    const avgVoto = allVotes.reduce((a,b)=>a+b,0) / allVotes.length;
+    const modifier = defenseModifierFromVoto(avgVoto);
+    return { modifier, avgVoto, gkId, fieldedDefenderIds, countedDefenderIds };
+  }
+
+
+  function clampNum(v, min, max, fallback){
+    const n = typeof v === 'number' && isFinite(v) ? v : parseFloat(v);
+    if(typeof n !== 'number' || isNaN(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+  }
+
+  // Normalizza nomi per il matching (rimuove accenti/apostrofi/spazi doppi, case-insensitive)
+  // così "De Bruyne" / "de  bruyné" / "DE BRUYNE" combaciano comunque.
+  function normalizeName(s){
+    return (s||'')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // rimuove accenti
+      .trim().toLowerCase().replace(/\s+/g,' ');
+  }
+
+  // ---- Componenti "in punti veri" condivise fra computeScore (indice di
+  // selezione interno) e computeExpectedFantaPoints (stima del voto fantacalcio
+  // reale, quella da confrontare con i punti reali della giornata). Vengono
+  // calcolate una sola volta qui per evitare che le due funzioni divergano.
+  function getExpectedComponents(p){
+    const fantavoto = (typeof p.fantavotoAtteso==='number') ? p.fantavotoAtteso : 6;
+    const useCleanSheet = (p.role==='P' || p.role==='D') && typeof p.cleanSheetProb === 'number';
+
+    // ---- Valore atteso di bonus/malus (EV = probabilità evento × punti evento) ----
+    // Se l'AI ha fornito le probabilità granulari (p_gol, p_assist, p_ammonizione, ecc.)
+    // le usiamo per un vero valore atteso; altrimenti fallback sul vecchio indice 0-3
+    // per compatibilità con dati salvati prima di questo aggiornamento.
+    let expectedBonusMalus;
+    const hasGranular = typeof p.pGol==='number' || typeof p.pAssist==='number';
+    if(hasGranular){
+      const pGol = (typeof p.pGol==='number') ? p.pGol/100 : 0;
+      const pAssist = (typeof p.pAssist==='number') ? p.pAssist/100 : 0;
+      const pAmmonizione = (typeof p.pAmmonizione==='number') ? p.pAmmonizione/100 : 0.12;
+      const pRigoreParato = (p.role==='P' && typeof p.pRigoreParato==='number') ? p.pRigoreParato/100 : 0;
+      expectedBonusMalus = pGol*FANTA_BONUS.gol
+                          + pAssist*FANTA_BONUS.assist
+                          + pAmmonizione*FANTA_BONUS.ammonizione
+                          + pRigoreParato*FANTA_BONUS.rigoreParato;
+      if(useCleanSheet) expectedBonusMalus += (p.cleanSheetProb/100) * FANTA_BONUS.cleanSheet;
+    } else {
+      const bonus = (typeof p.bonusPotenziale==='number') ? p.bonusPotenziale : 0;
+      expectedBonusMalus = bonus * 0.6; // riscalato per restare nello stesso ordine di grandezza
+    }
+
+    // Gol subito dal portiere: EV continuo = gol attesi subiti dalla squadra in
+    // questa partita (xGA) × malus per gol subito. Più preciso della sola
+    // clean_sheet_prob (che è binaria: 0 gol sì/no), perché una difesa che
+    // prende in media 1,8 gol non è "penalizzata" solo mancando il bonus, ma
+    // accumula malus proporzionali ai gol probabili (2, 3+ gol pesano di più).
+    if(p.role==='P' && typeof p.expectedGoalsConceded==='number'){
+      expectedBonusMalus += p.expectedGoalsConceded * FANTA_BONUS.golSubito;
+    }
+
+    // Rigore sbagliato: solo per il rigorista designato, EV = probabilità di
+    // calciare e sbagliare un rigore in questa partita × malus.
+    if(p.rigorista && typeof p.pRigoreSbagliato==='number'){
+      expectedBonusMalus += (p.pRigoreSbagliato/100) * FANTA_BONUS.rigoreSbagliato;
+    }
+
+    // Espulsione: EV = probabilità di espulsione in questa partita × malus.
+    if(typeof p.pEspulsione==='number'){
+      expectedBonusMalus += (p.pEspulsione/100) * FANTA_BONUS.espulsione;
+    }
+
+    // Player of the Match: EV = probabilità di essere eletto migliore in campo × bonus.
+    if(typeof p.pPotm==='number'){
+      expectedBonusMalus += (p.pPotm/100) * FANTA_BONUS.potm;
+    }
+
+    // NB: il modificatore di difesa NON è calcolato qui per singolo
+    // giocatore: dipende dall'undici che schieri (portiere + migliori 3
+    // difensori fielded) e va sommato UNA SOLA VOLTA al totale squadra,
+    // non al voto di ciascun P/D. Viene quindi applicato a parte, solo in
+    // formationExpectedPoints() (e nell'indice di selezione in formationScore()).
+
+    let diffAdj;
+    if(useCleanSheet){
+      // 50% = neutro (equivalente alla vecchia difficoltà "media").
+      // Scala tarata per restare comparabile al vecchio +-8 nei casi estremi
+      // (es. 90% => +12, 10% => -12) ma con gradazione continua nel mezzo.
+      diffAdj = (p.cleanSheetProb - 50) * 0.3;
+    } else {
+      // Priorità al calcolo OGGETTIVO dal differenziale di forza reale tra le
+      // due squadre (classifica corrente); solo se non riesce a identificare
+      // avversario/squadra si scende al giudizio manuale facile/media/difficile
+      // scelto per il giocatore (fallback, non più la fonte primaria).
+      const objDiff = computeObjectiveDifficulty(p);
+      diffAdj = (objDiff !== null) ? objDiff : ({facile:8, media:0, difficile:-8}[p.difficulty||'media'] ?? 0);
+    }
+
+    return { fantavoto, expectedBonusMalus, diffAdj };
+  }
+
+  // Indice di SELEZIONE interno (non è un voto fantacalcio!). Serve solo per
+  // ordinare giocatori/moduli e scegliere l'undici migliore: mescola con pesi
+  // arbitrari titolarità, forma/voto/bonus e difficoltà, quindi il numero che
+  // restituisce non è direttamente confrontabile con il punteggio reale della
+  // giornata. Per quello usa computeExpectedFantaPoints() più sotto.
+  function computeScore(p){
+    if(p.status==='infortunato' || p.status==='squalificato') return -Infinity;
+    const statusBase = {
+      titolare: 100,
+      ballottaggio: (typeof p.titolaritaProb==='number' ? p.titolaritaProb : 50),
+      panchina: 15
+    }[p.status] ?? 30;
+    const forma = (typeof p.forma==='number') ? p.forma : 0;
+    const { fantavoto, expectedBonusMalus, diffAdj } = getExpectedComponents(p);
+
+    // Rigoristi/piazzati: quota di potenziale extra (punizioni, seconde palle su corner, ecc.)
+    // non del tutto catturata dalla sola p_gol stimata dall'AI.
+    const setPieceAdj = (p.rigorista && p.role!=='P') ? 2 : 0;
+
+    return statusBase * weights.titolarita
+         + (forma*6 + (fantavoto-6)*10 + expectedBonusMalus*10 + setPieceAdj) * weights.forma
+         + diffAdj * weights.difficolta;
+  }
+
+  // Stima del VOTO FANTACALCIO REALE del giocatore per questa giornata:
+  // fantavoto atteso (voto puro in decimi, es. 6.2) + valore atteso di
+  // bonus/malus in punti veri (gol*3, assist*1, ammonizione*-0.5, ecc.).
+  // Questo è il numero da confrontare con "voto + bonus reali" a fine
+  // giornata (es. voto 6.5 + un gol = 9.5 reali), non computeScore().
+  function computeExpectedFantaPoints(p){
+    if(p.status==='infortunato' || p.status==='squalificato') return 0;
+    const { fantavoto, expectedBonusMalus } = getExpectedComponents(p);
+    return fantavoto + expectedBonusMalus;
+  }
+
+  // NOTA IMPORTANTE: il modificatore di difesa NON si somma al voto del
+  // singolo portiere/difensore (altrimenti, schierando 4 difensori, verrebbe
+  // sommato 4 volte). È un bonus/malus UNICO che si applica una sola volta
+  // al punteggio TOTALE della squadra schierata (vedi formationExpectedPoints).
+  // Per il valore individuale del giocatore (es. nello slot in campo) si usa
+  // direttamente computeExpectedFantaPoints(p), senza alcun modificatore.
+
+  function formationScore(slots){
+    let total = 0;
+    Object.values(slots).forEach(id=>{
+      const p = roster.find(x=>x.id===id);
+      if(p){
+        const sc = computeScore(p);
+        if(isFinite(sc)) total += sc;
+      }
+    });
+    // Il modificatore difesa si aggiunge una sola volta anche all'indice di
+    // selezione, così l'algoritmo automatico tiene conto del fatto che un
+    // portiere/reparto difensivo più solido regala un bonus a tutta la squadra.
+    const { modifier } = computeDefenseModifierForFormation(slots);
+    total += modifier * 10; // stessa scala usata da computeScore per fantavoto/bonus
+    return total;
+  }
+
+  // Somma dei voti fantacalcio REALI attesi (voto + EV bonus/malus di ogni
+  // titolare) PIÙ il modificatore di difesa, sommato UNA SOLA VOLTA al totale
+  // della squadra (non ripetuto per ogni portiere/difensore). È il numero
+  // comparabile con "Reali" nello storico formazioni.
+  function formationExpectedPoints(slots){
+    const { modifier } = computeDefenseModifierForFormation(slots);
+    let total = 0;
+    Object.values(slots).forEach(id=>{
+      const p = roster.find(x=>x.id===id);
+      if(p) total += computeExpectedFantaPoints(p);
+    });
+    total += modifier; // bonus/malus di squadra, una tantum
+    return total;
+  }
+
+  function pickBestLineupForModule(moduleKey){
+    const counts = MODULES[moduleKey];
+    const roles = ['D','C','A'];
+    const slots = {};
+    const eligible = p => p.status!=='infortunato' && p.status!=='squalificato';
+    const byScoreDesc = (a,b) => computeScore(b) - computeScore(a);
+
+    const gkPool = roster.filter(p=>p.role==='P' && eligible(p)).sort(byScoreDesc);
+    if(gkPool[0]) slots['P-0'] = gkPool[0].id;
+
+    roles.forEach((role, i)=>{
+      const need = counts[i];
+      const candidates = roster.filter(p=>p.role===role && eligible(p)).sort(byScoreDesc);
+      for(let s=0; s<need; s++){
+        if(candidates[s]) slots[role+'-'+s] = candidates[s].id;
+      }
+    });
+    return slots;
+  }
+
+  // ---------- trend di rendimento (ultime votazioni reali) ----------
+  // Con 5 partite si bilancia bene robustezza (non un singolo exploit/flop isolato)
+  // e reattività (un calo/crescita di 3-4 gare si vede comunque in tempo utile).
+  function analyzeTrend(p){
+    const r = Array.isArray(p.recentRatings) ? p.recentRatings : [];
+    if(r.length < 2) return null;
+    const last = r[r.length-1];
+    const prev = r.slice(0,-1);
+    const avgPrev = prev.reduce((a,b)=>a+b,0) / prev.length;
+    const variance = prev.length>1 ? prev.reduce((a,b)=>a+(b-avgPrev)**2,0)/prev.length : 0;
+    const std = Math.sqrt(variance);
+    const deviation = last - avgPrev;
+    // soglia: almeno 1 punto di voto, o 1.3 deviazioni standard se la serie è abbastanza stabile da darne una attendibile
+    const threshold = Math.max(1.0, std*1.3);
+    const outOfTrend = Math.abs(deviation) > threshold;
+
+    const mid = Math.floor(r.length/2) || 1;
+    const firstHalf = r.slice(0, mid);
+    const secondHalf = r.slice(mid);
+    const avgFirst = firstHalf.reduce((a,b)=>a+b,0)/firstHalf.length;
+    const avgSecond = secondHalf.length ? secondHalf.reduce((a,b)=>a+b,0)/secondHalf.length : avgFirst;
+    const momentum = avgSecond - avgFirst;
+    let direction = 'stabile';
+    if(momentum > 0.4) direction = 'crescita';
+    else if(momentum < -0.4) direction = 'calo';
+
+    return { avgPrev, last, deviation, outOfTrend, direction, momentum, avgAll: r.reduce((a,b)=>a+b,0)/r.length };
+  }
+
+
+  // Ultima classifica di tutti i moduli calcolata da pickBestFormation(true),
+  // usata per mostrare le alternative vicine al modulo scelto.
+  let lastFormationRanking = [];
+
+  // autoModule=true: prova tutti i moduli disponibili e tiene quello che massimizza
+  // il punteggio atteso totale (titolarità + forma/voto + valore atteso bonus/malus + difficoltà).
+  // Moduli ammessi alla scelta AUTOMATICA: nella tua lega il modificatore
+  // difesa scatta solo con almeno 4 difensori schierati, quindi 3-4-3 e 3-5-2
+  // sono esclusi dal calcolo "schiera l'undici migliore" (restano comunque
+  // selezionabili a mano dal menu, con avviso).
+  const AUTO_ELIGIBLE_MODULES = Object.keys(MODULES).filter(mod => MODULES[mod][0] >= 4);
+
+  function pickBestFormation(autoModule){
+    if(autoModule){
+      const ranking = AUTO_ELIGIBLE_MODULES.map(mod=>{
+        const slots = pickBestLineupForModule(mod);
+        return { module: mod, slots, score: formationScore(slots), expectedPoints: formationExpectedPoints(slots) };
+      }).sort((a,b)=> b.score - a.score);
+      lastFormationRanking = ranking;
+      const best = ranking[0];
+      formation.module = best.module;
+      formation.slots = best.slots;
+      $('#moduleSelect').value = best.module;
+      updateModuleDefWarning();
+    } else {
+      formation.slots = pickBestLineupForModule(formation.module);
+    }
+    saveFormation();
+    renderPitch();
+  }
+
+  function updateModuleDefWarning(){
+    const defCount = (MODULES[formation.module]||[0])[0];
+    $('#moduleDefWarning').style.display = (defCount < 4) ? 'block' : 'none';
+  }
+
+  $('#moduleSelect').addEventListener('change', (e)=>{
+    formation.module = e.target.value;
+    formation.slots = {}; // reset placements when module changes
+    saveFormation();
+    renderPitch();
+    updateModuleDefWarning();
+  });
+
+  $('#autoBtn').addEventListener('click', ()=>pickBestFormation(true));
+
+  function applyWeightsLockUI(){
+    $$('.weight-slider').forEach(sl=> sl.disabled = weightsLocked);
+    const btn = $('#unlockWeightsBtn');
+    if(weightsLocked){
+      btn.textContent = '🔒 Sblocca pesi personalizzati';
+    } else {
+      btn.textContent = '🔓 Ripristina pesi consigliati e riblocca';
+    }
+  }
+
+  $('#unlockWeightsBtn').addEventListener('click', ()=>{
+    if(weightsLocked){
+      // Sblocco: l'utente conferma esplicitamente di voler uscire dai valori
+      // consigliati. Nessun cambio di valore qui, solo abilita gli slider.
+      weightsLocked = false;
+    } else {
+      // Riblocco: riporta ai valori consigliati invece di lasciare gli slider
+      // dov'erano, altrimenti "riblocca" non toglierebbe davvero il bias già introdotto.
+      weights = { titolarita:1.5, forma:1, difficolta:0.5 };
+      weightsLocked = true;
+      $$('.weight-slider').forEach(sl=>{
+        sl.value = weights[sl.dataset.weight];
+        $('#w-'+sl.dataset.weight+'-val').textContent = weights[sl.dataset.weight]+'×';
+      });
+      if(Object.keys(formation.slots).length) pickBestFormation(true);
+    }
+    applyWeightsLockUI();
+    saveWeights();
+    saveWeightsLocked();
+  });
+
+  $$('.weight-slider').forEach(sl=>{
+    sl.addEventListener('input', (e)=>{
+      weights[e.target.dataset.weight] = parseFloat(e.target.value);
+      $('#w-'+e.target.dataset.weight+'-val').textContent = e.target.value+'×';
+      saveWeights();
+      if(Object.keys(formation.slots).length) pickBestFormation(true);
+    });
+  });
+
+  $$('.bonus-input').forEach(inp=>{
+    inp.addEventListener('change', (e)=>{
+      const v = parseFloat(e.target.value);
+      if(!isNaN(v)) FANTA_BONUS[e.target.dataset.bonus] = v;
+      saveBonusConfig();
+      renderPlayerList();
+      if(Object.keys(formation.slots).length) pickBestFormation(true);
+      else renderPitch();
+    });
+  });
+
+  // ---------- AI update (titolarità, ballottaggi, scontri diretti) ----------
+  const AI_MODEL = 'gemini-2.5-flash'; // informativo: il modello vero è scelto in api/update.js
+
+  function logStatus(msg, cls){
+    const el = $('#aiStatus');
+    const line = document.createElement('div');
+    line.className = 'line' + (cls ? ' '+cls : '');
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+  function clearStatus(){ $('#aiStatus').innerHTML = ''; }
+
+  function timeAgo(iso){
+    const diffMin = Math.max(0, Math.round((Date.now() - new Date(iso).getTime())/60000));
+    if(diffMin < 1) return 'aggiornato ora';
+    if(diffMin < 60) return `agg. ${diffMin} min fa`;
+    const h = Math.round(diffMin/60);
+    if(h < 24) return `agg. ${h} h fa`;
+    return `agg. ${Math.round(h/24)} gg fa`;
+  }
+
+  function teamsInRoster(){
+    const map = new Map();
+    roster.forEach(p=>{
+      const team = (p.team||'').trim();
+      if(!team) return;
+      if(!map.has(team)) map.set(team, []);
+      map.get(team).push(p);
+    });
+    return map;
+  }
+
+  function buildPrompt(team, players){
+    const names = players.map(p=>`- ${p.name} (${ROLE_LABEL[p.role]})`).join('\n');
+    const hasKeeperOrDef = players.some(p=>p.role==='P' || p.role==='D');
+    return `Cerca sul web informazioni aggiornate e recenti sulla squadra di Serie A "${team}" in vista della prossima giornata di campionato. Dai priorità a queste pagine specifiche (più affidabili di una ricerca generica perché aggiornate quotidianamente e strutturate proprio per il fantacalcio): fantacalcio.it/probabili-formazioni/serie-a (titolari/ballottaggi ufficiosi), fantacalcio.it/quotazioni-fantacalcio (quotazioni e ruoli), fantacalcio.it/voti-fantacalcio (storico voti reali già assegnati). Integra poi con gazzetta.it, corrieredellosport.it, sky sport per infortuni/squalifiche/conferenze stampa, e con sofascore/fbref/understat per statistiche avanzate (xG, xGA, tiri). Usa i siti ufficiali dei club solo per conferme dirette (es. comunicati infortuni). Capisci: chi gioca titolare, i ballottaggi aperti (e con che probabilità), gli infortunati e gli squalificati, chi calcia i rigori/punizioni, la forma recente dei singoli giocatori e della squadra, eventuali turnover previsti (coppe europee/infrasettimanale), e chi è il prossimo avversario.
+
+${hasKeeperOrDef ? `IMPORTANTE per portieri/difensori: non basarti solo su una difficoltà generica "facile/media/difficile" della partita — quella etichetta va bene per centrocampisti/attaccanti, ma per un portiere o un difensore conta molto di più il rischio di NON tenere la porta inviolata. Cerca quindi, se disponibili:
+- la probabilità stimata di "porta inviolata" (clean sheet) per la prossima partita, calcolata da quote scommesse 1X2/no-goal o da modelli xG (fonti tipo Opta, Sofascore, siti di pronostici, substack come "Expected Fanta")
+- i GOL ATTESI SUBITI (xGA) da questa squadra in QUESTA specifica partita — un numero continuo (es. 1.4), non solo la probabilità di clean sheet, perché ogni gol subito in più costa un malus indipendentemente dal fatto che il clean sheet sia già sfumato o meno. Stimalo da xG concesso medio della squadra corretto per la forza dell'attacco avversario, o da modelli/quote (es. quota "Over/Under gol squadra", mercati Asian handicap gol)
+- quanti tiri/tiri in porta subisce mediamente a partita la squadra in questione, e il suo xG concesso medio stagionale
+- come si comporta l'attacco dell'avversario (xG prodotto, gol segnati nelle ultime partite), non solo la sua difesa
+Attenzione: una squadra che subisce molti tiri non è automaticamente "difficile" per il fantacalcio classico — se il portiere para molto può comunque avere bonus parate, ma il rischio di subire gol (malus/mancato bonus porta inviolata) resta più alto. Riporta un numero, non solo un'etichetta.` : ''}
+
+Giocatori della mia rosa che militano in questa squadra:
+${names}
+
+Per ciascuno di questi giocatori, ESATTAMENTE con lo stesso nome che ti ho fornito, valuta:
+- lo stato previsto per la prossima giornata
+- la probabilità stimata di essere titolare (0-100)
+- la forma attuale del giocatore (-2 = pessima, 0 = normale, +2 = ottima)
+- il fantavoto medio atteso per questa partita (numero tipo 6.2, il voto puro dell'arbitro/pagelle, SENZA bonus/malus)
+- la probabilità stimata (0-100) che segni almeno un gol in questa partita: basati su xG/tiri attesi, ruolo, media realizzativa, avversario, MA anche sulla quota scommesse "marcatore/anytime goalscorer" quando disponibile (es. su siti di pronostici/bookmaker), che è spesso il segnale più affidabile per capire chi sono i favoriti del turno
+- la probabilità stimata (0-100) che fornisca almeno un assist in questa partita
+- la probabilità stimata (0-100) che venga ammonito (frequenza cartellini, ruolo, diffida, arbitro se rilevante)
+- la probabilità stimata (0-100) che venga espulso in questa partita (frequenza cartellini rossi/doppia ammonizione, ruolo, diffida)
+- la probabilità stimata (0-100) che venga eletto Player of the Match / migliore in campo in questa partita (rilevante soprattutto per i big/trascinatori della squadra)
+- se è lui il rigorista/incaricato dei piazzati principali della squadra (true/false)
+- SOLO se è il rigorista designato: probabilità stimata (0-100) che sbagli un rigore SE lo calcia in questa partita, basata su statistiche recenti dal dischetto
+${hasKeeperOrDef ? '- SOLO se è un portiere: probabilità stimata (0-100) che pari un rigore in questa partita, basata su statistiche recenti di parate su rigore' : ''}
+
+Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown, senza backtick, in questo identico formato:
+{
+  "opponent": "il prossimo avversario SEMPRE in questo identico formato, senza deviazioni: \"vs NomeSquadra (casa)\" oppure \"vs NomeSquadra (trasf.)\", con eventualmente data/ora aggiunte dopo un trattino, es. \"vs Cagliari (trasf.) — lun 7/9 h18:30\". È fondamentale iniziare con \"vs \" e usare esattamente \"(casa)\" o \"(trasf.)\": questo campo viene analizzato automaticamente dal codice per calcolare la difficoltà della partita, un formato diverso lo rompe",
+  "goals_conceded_expected": numero o null (gol attesi subiti da questa squadra in QUESTA partita, es. 1.4; rilevante soprattutto se ci sono portieri in rosa),
+  "shots_conceded_avg": numero o null (tiri subiti a partita in media, stagione corrente),
+  "players": [
+    {
+      "name": "nome esatto fornito",
+      "status": "titolare" | "ballottaggio" | "panchina" | "infortunato" | "squalificato",
+      "titolarita_prob": 0-100,
+      "forma": -2 a 2,
+      "fantavoto_atteso": numero es. 6.2 (voto puro, senza bonus/malus),
+      "p_gol": 0-100,
+      "p_assist": 0-100,
+      "p_ammonizione": 0-100,
+      "p_espulsione": 0-100,
+      "p_potm": 0-100,
+      "p_rigore_parato": 0-100 o null (solo per portieri, altrimenti ometti/null),
+      "p_rigore_sbagliato": 0-100 o null (solo se rigorista designato, altrimenti ometti/null),
+      "rigorista": true | false,
+      "note": "breve nota utile max 18 parole: motivo, ballottaggio con chi, rigorista, trend forma, diffida, turnover, ecc."
+    }
+  ]
+}`;
+  }
+
+  function stripJsonFences(text){
+    return text.replace(/```json/gi,'').replace(/```/g,'').trim();
+  }
+
+  // I modelli a volte mettono un vero "a capo" (o tab, o altri caratteri di controllo)
+  // dentro un campo testo invece di scriverlo come \n escapato: questo rompe JSON.parse
+  // con "Bad control character in string literal". Qui li troviamo (solo quando siamo
+  // DENTRO una stringa JSON, rispettando gli escape) e li ri-escapiamo correttamente.
+  function sanitizeJsonControlChars(str){
+    let out = '';
+    let inString = false;
+    let escaping = false;
+    for(let i=0; i<str.length; i++){
+      const ch = str[i];
+      const code = str.charCodeAt(i);
+      if(inString){
+        if(escaping){ out += ch; escaping = false; continue; }
+        if(ch === '\\'){ out += ch; escaping = true; continue; }
+        if(ch === '"'){ inString = false; out += ch; continue; }
+        if(code < 0x20){
+          if(ch === '\n') out += '\\n';
+          else if(ch === '\r') out += '\\r';
+          else if(ch === '\t') out += '\\t';
+          else out += '\\u' + code.toString(16).padStart(4,'0');
+          continue;
+        }
+        out += ch;
+      } else {
+        if(ch === '"') inString = true;
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  // Prova a fare il parse in modo robusto: fences → sanitize → parse diretto,
+  // e se fallisce isola il blocco {...} più esterno e riprova.
+  function parseAiJson(text){
+    const clean = sanitizeJsonControlChars(stripJsonFences(text));
+    try{
+      return JSON.parse(clean);
+    }catch(e){
+      const match = clean.match(/\{[\s\S]*\}/);
+      if(match){
+        try{ return JSON.parse(match[0]); }catch(e2){ /* cade nel throw sotto */ }
+      }
+      throw new Error('JSON non valido: ' + e.message);
+    }
+  }
+
+  // ---------- Chiamata AI: proxy serverless (Vercel) → Gemini ----------
+  // Nessuna API key nel browser: la chiave Gemini resta solo lato server (env var GEMINI_API_KEY).
+  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
   async function anthropicMessagesOnce(payload){
     const response = await fetch('/api/update', {
       method: 'POST',
