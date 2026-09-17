@@ -2283,7 +2283,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   // quindi la richiesta in più batch più piccoli, interrogati in parallelo: ogni
   // batch ha molte meno ricerche da fare e quindi molte più probabilità di
   // completarle tutte prima di rispondere.
-  const TEAM_XG_BATCH_SIZE = 6;
+  const TEAM_XG_BATCH_SIZE = 4;
 
   function chunkArray(arr, size){
     const out = [];
@@ -2333,9 +2333,13 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   async function fetchXgRound(teamNames, size, onRetry){
     const batches = chunkArray(teamNames, size);
     const outcomes = await Promise.all(
-      batches.map(batchTeams => callTeamXgUpdateBatch(batchTeams, onRetry)
-        .then(r => (r.teams||[]))
-        .catch(() => []))
+      batches.map(async (batchTeams, i) => {
+        if(i>0) await sleep(i*350); // scaglionamento anti-burst, vedi callFullUpdate
+        try{
+          const r = await callTeamXgUpdateBatch(batchTeams, onRetry);
+          return r.teams || [];
+        }catch(e){ return []; }
+      })
     );
     return outcomes.flat();
   }
@@ -2360,6 +2364,14 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     let missing = findMissingTeams(allTeams, teams);
     if(missing.length){
       const retryTeams = await fetchXgRound(missing, 2, onRetry);
+      teams = teams.concat(retryTeams);
+      missing = findMissingTeams(allTeams, teams);
+    }
+    // Terzo giro, una squadra alla volta: qui la probabilità che il modello
+    // completi la ricerca è massima, è il modo più affidabile di recuperare
+    // le ultime squadre rimaste scoperte dopo i due giri a batch.
+    if(missing.length){
+      const retryTeams = await fetchXgRound(missing, 1, onRetry);
       teams = teams.concat(retryTeams);
       missing = findMissingTeams(allTeams, teams);
     }
@@ -2415,11 +2427,28 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     return { matched, total: Object.keys(TEAM_XG_STATS).length, unmatched, withSplit, stillMissing: result.stillMissing||[] };
   }
 
-  async function callFullUpdate(map, matchday, onRetry){
+  // Stesso problema di fondo della tabella xG di lega (vedi sopra): chiedere in
+  // UNA sola chiamata titolarità + xG90 + rigori + voti recenti ecc. per TUTTE le
+  // squadre della rosa insieme è troppo per un modello con ricerca grounded, che
+  // tende a fermarsi a metà lasciando alcune squadre (e quindi i loro xg90) senza
+  // dati. Applichiamo lo stesso pattern batch+retry usato per callTeamXgUpdate.
+  const FULL_UPDATE_BATCH_SIZE = 3; // squadre per batch, non giocatori
+
+  function chunkMap(map, size){
+    const entries = Array.from(map.entries());
+    const out = [];
+    for(let i=0; i<entries.length; i+=size) out.push(new Map(entries.slice(i, i+size)));
+    return out;
+  }
+
+  // Nota: sleep() per lo scaglionamento anti-burst è già definita più sotto,
+  // vicino ad anthropicMessages — qui viene solo riusata.
+
+  async function callFullUpdateBatch(subMap, matchday, onRetry){
     const data = await anthropicMessages({
       model: AI_MODEL,
-      max_tokens: estimateFullUpdateMaxTokens(map),
-      messages: [{ role: 'user', content: buildFullPrompt(map, matchday) }],
+      max_tokens: estimateFullUpdateMaxTokens(subMap),
+      messages: [{ role: 'user', content: buildFullPrompt(subMap, matchday) }],
       tools: [{ type: 'web_search_20250305', name: 'web_search' }]
     }, onRetry);
     const text = (data.content||[])
@@ -2428,6 +2457,52 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       .join('\n');
     if(!text.trim()) throw new Error('risposta vuota');
     return parseAiJson(text);
+  }
+
+  // Quali squadre (chiavi della map originale) NON compaiono tra i risultati
+  // ottenuti finora, con lo stesso matching (esatto poi per sottostringa) usato
+  // in applyFullUpdate per riconoscere il nome squadra scritto dall'AI.
+  function findMissingFullTeams(map, resultTeams){
+    const teamKeys = Array.from(map.keys());
+    const covered = new Set();
+    (resultTeams||[]).forEach(tr=>{
+      const wanted = (tr.team||'').trim().toLowerCase();
+      if(!wanted) return;
+      let key = teamKeys.find(k=>k.toLowerCase()===wanted);
+      if(!key) key = teamKeys.find(k=>wanted.includes(k.toLowerCase()) || k.toLowerCase().includes(wanted));
+      if(key) covered.add(key);
+    });
+    return teamKeys.filter(k=>!covered.has(k));
+  }
+
+  async function fetchFullRound(map, size, matchday, onRetry){
+    const batches = chunkMap(map, size);
+    const outcomes = await Promise.all(
+      batches.map(async (subMap, i)=>{
+        if(i>0) await sleep(i*350); // scaglionamento anti-burst
+        try{
+          const r = await callFullUpdateBatch(subMap, matchday, onRetry);
+          return r.teams || [];
+        }catch(e){ return []; }
+      })
+    );
+    return outcomes.flat();
+  }
+
+  // Primo giro a batch da 3 squadre; le squadre rimaste scoperte (batch fallito o
+  // risposta incompleta) vengono richieste una seconda volta UNA ALLA VOLTA, dove
+  // la probabilità che il modello completi tutte le ricerche necessarie è massima.
+  async function callFullUpdate(map, matchday, onRetry){
+    let teams = await fetchFullRound(map, FULL_UPDATE_BATCH_SIZE, matchday, onRetry);
+    let missing = findMissingFullTeams(map, teams);
+    if(missing.length){
+      const missingMap = new Map(missing.map(k=>[k, map.get(k)]));
+      const retryTeams = await fetchFullRound(missingMap, 1, matchday, onRetry);
+      teams = teams.concat(retryTeams);
+      missing = findMissingFullTeams(map, teams);
+    }
+    if(teams.length === 0) throw new Error('risposta vuota (tutti i batch falliti)');
+    return { teams, stillMissing: missing };
   }
 
   function applyFullUpdate(map, result){
@@ -2460,7 +2535,8 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     clearStatus();
     const teams = Array.from(map.keys());
     const matchday = parseInt($('#matchdayInput').value, 10) || null;
-    logStatus(`Cerco info per ${teams.length} squadre in un'unica richiesta (${teams.join(', ')})…`);
+    const fullBatchCount = Math.ceil(teams.length / FULL_UPDATE_BATCH_SIZE);
+    logStatus(`Cerco info per ${teams.length} squadre in ${fullBatchCount} gruppi da ${FULL_UPDATE_BATCH_SIZE} (${teams.join(', ')})…`);
     const xgBatchCount = Math.ceil(Object.keys(TEAM_XG_STATS).length / TEAM_XG_BATCH_SIZE);
     logStatus(`In parallelo aggiorno anche xG/xGA di tutte le 20 squadre, in ${xgBatchCount} gruppi da ${TEAM_XG_BATCH_SIZE} (per la difficoltà partita)…`);
     try{
