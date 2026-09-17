@@ -586,6 +586,13 @@
 
   ::-webkit-scrollbar{height:6px;width:6px;}
   ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.2);border-radius:4px;}
+.stats-table{border-collapse:collapse;width:100%;font-size:10.5px;white-space:nowrap;}
+.stats-table th,.stats-table td{padding:4px 7px;text-align:right;border-bottom:1px solid rgba(255,255,255,0.08);}
+.stats-table th:first-child,.stats-table td:first-child{text-align:left;position:sticky;left:0;background:#1b2a20;}
+.stats-table th{color:#8C9A90;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.02em;}
+.stats-table tbody tr:hover{background:rgba(255,255,255,0.04);}
+.stats-table .sub{color:var(--ink-soft);font-size:9.5px;}
+.stats-table-title{font-size:12px;font-weight:600;color:#DCE6DF;margin:10px 0 4px;}
 </style>
 </head>
 <body>
@@ -713,6 +720,19 @@
       <div class="weights-title">Difficoltà partita: calcolata, non a occhio</div>
       <div style="font-size:11px;color:#8C9A90;">
         La difficoltà di ogni partita si calcola dai GOL ATTESI (xG/xGA), non dai gol reali: lo xG riflette la qualità delle occasioni create/concesse tiro per tiro, quindi è meno soggetto a rimbalzi fortunati o un portiere in giornata no rispetto al risultato secco. Differenziato per ruolo (attacco avversario per portieri/difensori, difesa avversaria per centrocampisti/attaccanti) e stabilizzato mescolando i gol REALI della Serie A 2025/26 (6 partite equivalenti di storico) alle prime giornate di quest'anno — sia per il rendimento generale che per lo split CASA/TRASFERTA reale di ogni squadra (fonte soccerstats.com), così il vantaggio-casa specifico di ogni squadra è già attivo da ora, non solo a stagione avanzata. Frosinone, Monza e Venezia (neopromosse, senza storico Serie A) usano lo split reale solo dopo aver giocato almeno 5 partite in quel campo; fino ad allora, e per le altre squadre finché l'AI non ha dati sufficienti, resta un vantaggio-casa generico. Il pulsante "🔎 Aggiorna con AI" qui sopra aggiorna in automatico xG/xGA totali e per casa/trasferta di tutte le 20 squadre insieme ai giocatori. <span id="teamXgUpdatedLabel"></span> Il menu a tendina su ogni giocatore resta come riserva manuale solo per i casi in cui l'avversario non viene riconosciuto. Stesso principio per la probabilità gol dei singoli giocatori: ogni aggiornamento recupera anche lo xG/90' di ciascuno (corrente e, come prior, quello della stagione scorsa) e il codice calcola IN AUTONOMIA, con un modello di Poisson, una seconda stima indipendente dal giudizio dell'AI; la probabilità mostrata è la media delle due (visibili separate tra parentesi, "AI" vs "xG90"), così una stima AI fuori scala viene comunque ricondotta al dato oggettivo.
+      </div>
+    </div>
+
+    <div id="statsTablesBox" class="weights-box">
+      <div class="weights-title">📊 Tabella statistiche xG (tracciata nel tempo)</div>
+      <div style="font-size:11px;color:#8C9A90;margin-bottom:8px;">
+        Tutti i dati grezzi usati per calcolare difficoltà, probabilità gol e gol attesi subiti: xG/xGA per squadra (con split casa/trasferta e prior della stagione scorsa) e xG/90' per ciascun giocatore in rosa (con prior della stagione scorsa). Si aggiorna da sola ad ogni "🔎 Aggiorna con AI"; la colonna "storico" mostra le ultime rilevazioni per vedere il trend nel tempo.
+      </div>
+      <button id="toggleStatsTablesBtn" type="button" style="margin-bottom:8px;font-size:11px;background:none;border:1px solid rgba(255,255,255,0.25);color:#B9C7BC;border-radius:6px;padding:4px 8px;cursor:pointer;">Mostra tabelle ▾</button>
+      <div id="statsTablesContent" style="display:none;">
+        <div style="overflow-x:auto;"><div id="teamStatsTableWrap"></div></div>
+        <div style="overflow-x:auto;"><div id="attackStatsTableWrap"></div></div>
+        <div style="overflow-x:auto;"><div id="defenseStatsTableWrap"></div></div>
       </div>
     </div>
 
@@ -896,6 +916,13 @@
 
   let TEAM_ATTACK = {}, TEAM_DEFENSE = {};
   let TEAM_ATTACK_HOME = {}, TEAM_DEFENSE_HOME = {}, TEAM_ATTACK_AWAY = {}, TEAM_DEFENSE_AWAY = {};
+  // Tassi "gol/gol attesi a partita" già blendati (xG corrente + prior storico),
+  // esposti qui (oltre agli indici atk/def centrati sulla media) perché servono
+  // anche al modello di gol attesi subiti (computeGoalsConcededStat) e alla
+  // tabella statistiche in UI. LEAGUE_AVG_* = media di campionato dello stesso
+  // insieme di squadre usate per calcolarli (generale, o solo casa/trasferta).
+  let TEAM_PERGAME = {}, TEAM_PERGAME_HOME = {}, TEAM_PERGAME_AWAY = {};
+  let LEAGUE_AVG_GF = 0, LEAGUE_AVG_GS = 0, LEAGUE_AVG_GF_HOME = null, LEAGUE_AVG_GF_AWAY = null;
   let teamXgLastUpdate = null; // ISO string, per mostrare "aggiornato Xh fa" in UI
 
   // ---------- xG per GIOCATORE (stesso principio dello shrinkage di squadra) ----------
@@ -954,6 +981,8 @@
     });
     TEAM_ATTACK = atk;
     TEAM_DEFENSE = def;
+    TEAM_PERGAME = perGame;
+    LEAGUE_AVG_GF = avgGF; LEAGUE_AVG_GS = avgGS;
 
     // Split casa/trasferta: stesso shrinkage bayesiano di sopra ma applicato
     // separatamente per campo, usando lo storico REALE casa/trasferta
@@ -985,18 +1014,20 @@
           eligible.push(t);
         }
       });
-      if(eligible.length < 2) return { atk:{}, def:{} }; // troppo poche squadre con dati sufficienti
+      if(eligible.length < 2) return { atk:{}, def:{}, perGame:{}, avgGF:null }; // troppo poche squadre con dati sufficienti
       let sGF=0, sGS=0;
       eligible.forEach(t=>{ sGF += perGameV[t].gfpg; sGS += perGameV[t].gspg; });
       const aGF = sGF/eligible.length, aGS = sGS/eligible.length;
       const a={}, d={};
       eligible.forEach(t=>{ a[t] = perGameV[t].gfpg - aGF; d[t] = aGS - perGameV[t].gspg; });
-      return { atk:a, def:d };
+      return { atk:a, def:d, perGame:perGameV, avgGF:aGF };
     }
     const home = buildVenueRatings('gHome','xgHome','xgaHome','home');
     const away = buildVenueRatings('gAway','xgAway','xgaAway','away');
     TEAM_ATTACK_HOME = home.atk; TEAM_DEFENSE_HOME = home.def;
     TEAM_ATTACK_AWAY = away.atk; TEAM_DEFENSE_AWAY = away.def;
+    TEAM_PERGAME_HOME = home.perGame; TEAM_PERGAME_AWAY = away.perGame;
+    LEAGUE_AVG_GF_HOME = home.avgGF; LEAGUE_AVG_GF_AWAY = away.avgGF;
   }
   recomputeTeamRatings();
 
@@ -1129,6 +1160,45 @@
     }
     // oppThreat alto = avversario minaccioso per questo ruolo = partita difficile = diffAdj negativo.
     return clampNum(-oppThreat * DIFF_SCALE, -14, 14, 0);
+  }
+
+  // Stima statistica (nessun input AI, solo i tassi xG blendati già calcolati
+  // da recomputeTeamRatings) dei GOL ATTESI SUBITI dalla squadra del
+  // giocatore in QUESTA partita: modello moltiplicativo standard (la stessa
+  // logica dei modelli "Poisson bivariati" usati in letteratura per le
+  // previsioni di risultato) — quanto la propria squadra concede in media
+  // (blendato con lo storico) corretto per quanto è forte l'attacco
+  // avversario rispetto alla media di campionato. Usa lo split casa/
+  // trasferta quando disponibile per ENTRAMBE le squadre coinvolte,
+  // altrimenti ricade sui rating generali con un piccolo aggiustamento
+  // vantaggio-casa generico. Ritorna null se non identifica le due squadre o
+  // se non c'è ancora abbastanza dato xG di squadra.
+  function computeGoalsConcededStat(p){
+    const ownKey = resolveTeamKey(p.team);
+    const parsed = parseOpponentInfo(p.opponent);
+    if(!ownKey || !parsed) return null;
+    const oppKey = resolveTeamKey(parsed.team);
+    if(!oppKey) return null;
+    let ownGSpg, oppGFpg, avgGF;
+    if(parsed.isHome===true && TEAM_PERGAME_HOME[ownKey] && TEAM_PERGAME_AWAY[oppKey]){
+      ownGSpg = TEAM_PERGAME_HOME[ownKey].gspg;
+      oppGFpg = TEAM_PERGAME_AWAY[oppKey].gfpg;
+      avgGF = LEAGUE_AVG_GF_AWAY;
+    } else if(parsed.isHome===false && TEAM_PERGAME_AWAY[ownKey] && TEAM_PERGAME_HOME[oppKey]){
+      ownGSpg = TEAM_PERGAME_AWAY[ownKey].gspg;
+      oppGFpg = TEAM_PERGAME_HOME[oppKey].gfpg;
+      avgGF = LEAGUE_AVG_GF_HOME;
+    } else {
+      if(!TEAM_PERGAME[ownKey] || !TEAM_PERGAME[oppKey]) return null;
+      ownGSpg = TEAM_PERGAME[ownKey].gspg;
+      oppGFpg = TEAM_PERGAME[oppKey].gfpg;
+      avgGF = LEAGUE_AVG_GF;
+      if(parsed.isHome===true) oppGFpg -= HOME_ADV;
+      else if(parsed.isHome===false) oppGFpg += HOME_ADV;
+    }
+    if(!avgGF) return null;
+    const lambda = ownGSpg * (Math.max(0.1, oppGFpg) / avgGF);
+    return clampNum(lambda, 0, 6, null);
   }
 
 
@@ -1374,8 +1444,8 @@
             <input type="text" data-field="opponent" placeholder="Prossimo avversario…" value="${escapeAttr(p.opponent||'')}">
           </div>
           ${p.note ? `<div class="player-note">${escapeHtml(p.note)}</div>` : ''}
-          ${(p.role==='P'||p.role==='D') && typeof p.cleanSheetProb==='number' ? `<div class="player-note" style="font-style:normal;">🧤 Porta inviolata: <b>${Math.round(p.cleanSheetProb)}%</b>${typeof p.shotsConcededAvg==='number' ? ` · ${p.shotsConcededAvg} tiri subiti/gara` : ''}</div>` : ''}
-          ${p.role==='P' && typeof p.expectedGoalsConceded==='number' ? `<div class="player-note" style="font-style:normal;">🥅 Gol attesi subiti: <b>${p.expectedGoalsConceded.toFixed(2)}</b> <span style="color:var(--ink-soft);">(malus ~${(p.expectedGoalsConceded*FANTA_BONUS.golSubito).toFixed(2)} pt)</span></div>` : ''}
+          ${(p.role==='P'||p.role==='D') && typeof p.cleanSheetProb==='number' ? `<div class="player-note" style="font-style:normal;">🧤 Porta inviolata: <b>${Math.round(p.cleanSheetProb)}%</b>${typeof p.shotsConcededAvg==='number' ? ` · ${p.shotsConcededAvg} tiri subiti/gara` : ''}${typeof p.cleanSheetAI==='number' && typeof p.cleanSheetStat==='number' ? ` <span style="color:var(--ink-soft);">(AI ${Math.round(p.cleanSheetAI)}% · xG ${Math.round(p.cleanSheetStat)}%)</span>` : ''}</div>` : ''}
+          ${p.role==='P' && typeof p.expectedGoalsConceded==='number' ? `<div class="player-note" style="font-style:normal;">🥅 Gol attesi subiti: <b>${p.expectedGoalsConceded.toFixed(2)}</b> <span style="color:var(--ink-soft);">(malus ~${(p.expectedGoalsConceded*FANTA_BONUS.golSubito).toFixed(2)} pt${typeof p.golSubitoAI==='number' && typeof p.golSubitoStat==='number' ? ` · AI ${p.golSubitoAI.toFixed(2)} · xG ${p.golSubitoStat.toFixed(2)}` : ''})</span></div>` : ''}
           ${(p.role==='P'||p.role==='D') && Object.values(formation.slots).includes(p.id) && fieldedDefMod.avgVoto!=null ? `<div class="player-note" style="font-style:normal;">🛡️ Concorre al modificatore difesa di squadra: <b>${fieldedDefMod.modifier>=0?'+':''}${fieldedDefMod.modifier.toFixed(2)}</b> <span style="color:var(--ink-soft);">pt sommato una volta al totale squadra (media portiere + migliori 3 difensori: ${fieldedDefMod.avgVoto.toFixed(2)})</span></div>` : ''}
           ${typeof p.pGol==='number' && (p.role==='A'||p.role==='C') ? `<div class="player-note" style="font-style:normal;">⚽ Prob. gol: <b>${Math.round(p.pGol)}%</b>${typeof p.pGolAI==='number' && typeof p.pGolStat==='number' ? ` <span style="color:var(--ink-soft);">(AI ${Math.round(p.pGolAI)}% · xG90 ${Math.round(p.pGolStat)}%)</span>` : ''}</div>` : ''}
           ${p.rigorista && typeof p.pRigoreSbagliato==='number' ? `<div class="player-note" style="font-style:normal;">🎯 Rischio rigore sbagliato: <b>${Math.round(p.pRigoreSbagliato)}%</b></div>` : ''}
@@ -2031,8 +2101,24 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       if(entry.note) p.note = String(entry.note).slice(0,300);
       if(result.opponent) p.opponent = String(result.opponent).slice(0,200);
       if(result.difficulty && DIFF_LABEL[result.difficulty]) p.difficulty = result.difficulty;
-      if(typeof result.clean_sheet_prob === 'number') p.cleanSheetProb = clampNum(result.clean_sheet_prob, 0, 100, p.cleanSheetProb);
-      if(typeof result.goals_conceded_expected === 'number') p.expectedGoalsConceded = clampNum(result.goals_conceded_expected, 0, 10, p.expectedGoalsConceded);
+      // Stessa logica di blend AI+statistica usata sopra per p_gol, applicata
+      // ai gol attesi subiti (rilevante per P/D): golSubitoStat viene da
+      // computeGoalsConcededStat (solo tassi xG di squadra, nessun input AI),
+      // cleanSheetStat è la probabilità di Poisson di prendere 0 gol dato
+      // quel lambda (e^-lambda). Il valore finale usato dal resto del
+      // calcolo è la media tra AI e statistica, come per p_gol.
+      if(typeof result.clean_sheet_prob === 'number') p.cleanSheetAI = clampNum(result.clean_sheet_prob, 0, 100, p.cleanSheetAI);
+      if(typeof result.goals_conceded_expected === 'number') p.golSubitoAI = clampNum(result.goals_conceded_expected, 0, 10, p.golSubitoAI);
+      const golSubitoStat = computeGoalsConcededStat(p);
+      p.golSubitoStat = golSubitoStat;
+      const cleanSheetStat = (golSubitoStat !== null) ? Math.exp(-golSubitoStat) * 100 : null;
+      p.cleanSheetStat = cleanSheetStat;
+      p.expectedGoalsConceded = (typeof p.golSubitoAI === 'number')
+        ? (golSubitoStat !== null ? clampNum((p.golSubitoAI + golSubitoStat)/2, 0, 10, p.golSubitoAI) : p.golSubitoAI)
+        : golSubitoStat;
+      p.cleanSheetProb = (typeof p.cleanSheetAI === 'number')
+        ? (cleanSheetStat !== null ? clampNum((p.cleanSheetAI + cleanSheetStat)/2, 0, 100, p.cleanSheetAI) : p.cleanSheetAI)
+        : cleanSheetStat;
       if(typeof result.shots_conceded_avg === 'number') p.shotsConcededAvg = clampNum(result.shots_conceded_avg, 0, 40, p.shotsConcededAvg);
       if(typeof entry.titolarita_prob === 'number') p.titolaritaProb = clampNum(entry.titolarita_prob, 0, 100, p.titolaritaProb);
       if(typeof entry.forma === 'number') p.forma = clampNum(entry.forma, -2, 2, p.forma);
@@ -2053,11 +2139,14 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       const xg90Prev = clampNum(entry.xg90_prec, 0, 3, (typeof prevPxg.xg90Prev==='number') ? prevPxg.xg90Prev : null);
       const minPrev = clampNum(entry.minuti_prec, 0, 5000, (typeof prevPxg.minutesPrev==='number') ? prevPxg.minutesPrev : null);
       if(xg90Cur !== null && minCur !== null){
-        PLAYER_XG_STATS[pxgKey] = { xg90: xg90Cur, minutes: minCur, xg90Prev, minutesPrev: minPrev, lastUpdate: now };
+        const history = Array.isArray(prevPxg.history) ? prevPxg.history.slice() : [];
+        history.push({ date: now, xg90: xg90Cur, minutes: minCur });
+        if(history.length > 8) history.splice(0, history.length-8);
+        PLAYER_XG_STATS[pxgKey] = { xg90: xg90Cur, minutes: minCur, xg90Prev, minutesPrev: minPrev, lastUpdate: now, history };
       } else if(xg90Prev !== null && typeof prevPxg.xg90 !== 'number'){
         // Nessun dato di quest'anno ma un prior valido (es. neo-titolare senza
         // ancora minuti sufficienti): salva comunque il prior da solo.
-        PLAYER_XG_STATS[pxgKey] = { xg90: prevPxg.xg90 ?? null, minutes: prevPxg.minutes || 0, xg90Prev, minutesPrev: minPrev, lastUpdate: now };
+        PLAYER_XG_STATS[pxgKey] = { xg90: prevPxg.xg90 ?? null, minutes: prevPxg.minutes || 0, xg90Prev, minutesPrev: minPrev, lastUpdate: now, history: prevPxg.history || [] };
       }
       const pGolStat = computePGolStat(p);
       p.pGolStat = pGolStat;
@@ -2291,6 +2380,14 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       if(g===null || xg===null || xga===null) return; // dato incompleto, non tocco quella squadra
       const prevSplit = TEAM_XG_STATS[key] || {};
       const stats = { g, xg, xga };
+      // Storico: ogni aggiornamento aggiunge uno snapshot {data, g, xg, xga}
+      // invece di sovrascrivere e basta, così in tabella si vede come sono
+      // cambiati xG/xGA nel tempo (non solo l'ultimo valore). Tenute solo le
+      // ultime 8 rilevazioni per non far crescere indefinitamente il salvataggio.
+      const history = Array.isArray(prevSplit.history) ? prevSplit.history.slice() : [];
+      history.push({ date: new Date().toISOString(), g, xg, xga });
+      if(history.length > 8) history.splice(0, history.length-8);
+      stats.history = history;
       const gHome = clampNum(entry.gHome, 1, 30, null);
       const xgHome = clampNum(entry.xgHome, 0, 100, null);
       const xgaHome = clampNum(entry.xgaHome, 0, 100, null);
@@ -2413,6 +2510,16 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
   }
 
   $('#aiUpdateBtn').addEventListener('click', runAIUpdate);
+
+  $('#toggleStatsTablesBtn').addEventListener('click', ()=>{
+    const content = $('#statsTablesContent');
+    const btn = $('#toggleStatsTablesBtn');
+    const showing = content.style.display !== 'none';
+    content.style.display = showing ? 'none' : 'block';
+    btn.textContent = showing ? 'Mostra tabelle ▾' : 'Nascondi tabelle ▴';
+    if(!showing) renderStatsTables();
+  });
+
 
   // Aggrega lo scarto (voto reale - voto atteso) per ruolo su tutte le
   // giornate salvate che hanno almeno un voto reale per-giocatore inserito
@@ -2764,6 +2871,143 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
       : `${total} giocatori in rosa · ${titolari} titolari · ${dubbi} in ballottaggio`;
   }
 
+  // ---------- Tabelle statistiche xG (squadre + giocatori, con storico) ----------
+  // Piccolo sparkline SVG inline per mostrare il trend delle ultime
+  // rilevazioni di uno storico (history) senza dipendenze esterne: una
+  // polilinea semplice, min/max locali, nessun asse (basta l'andamento).
+  function sparkline(values, opts){
+    opts = opts || {};
+    const w = opts.w || 60, h = opts.h || 18;
+    const vals = (values||[]).filter(v=>typeof v==='number' && isFinite(v));
+    if(vals.length < 2) return '<span class="sub">—</span>';
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const range = (max - min) || 1;
+    const step = w / (vals.length - 1);
+    const pts = vals.map((v,i)=> `${(i*step).toFixed(1)},${(h - ((v-min)/range)*h).toFixed(1)}`).join(' ');
+    const trendUp = vals[vals.length-1] >= vals[0];
+    const color = trendUp ? '#6fae7a' : '#c0857f';
+    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="vertical-align:middle;"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
+  }
+  function fmtNum(v, digits){
+    return (typeof v==='number' && isFinite(v)) ? v.toFixed(digits==null?2:digits) : '—';
+  }
+  function fmtPct(v){
+    return (typeof v==='number' && isFinite(v)) ? Math.round(v)+'%' : '—';
+  }
+
+  function renderTeamStatsTable(){
+    const wrap = $('#teamStatsTableWrap');
+    if(!wrap) return;
+    const teams = Object.keys(TEAM_XG_STATS).sort();
+    const rows = teams.map(t=>{
+      const cur = TEAM_XG_STATS[t];
+      const prior = LAST_SEASON_STATS[t];
+      const pg = TEAM_PERGAME[t] || {};
+      const pgH = TEAM_PERGAME_HOME[t], pgA = TEAM_PERGAME_AWAY[t];
+      const hist = Array.isArray(cur.history) ? cur.history : [];
+      const spk = sparkline(hist.map(h=> h.g>0 ? h.xg/h.g : null));
+      return `<tr>
+        <td>${escapeHtml(t)}</td>
+        <td>${fmtNum(cur.xg,1)} / ${cur.g}g</td>
+        <td>${fmtNum(cur.xga,1)} / ${cur.g}g</td>
+        <td><b>${fmtNum(pg.gfpg)}</b></td>
+        <td><b>${fmtNum(pg.gspg)}</b></td>
+        <td class="sub">${pgH ? fmtNum(pgH.gfpg) : '—'}</td>
+        <td class="sub">${pgH ? fmtNum(pgH.gspg) : '—'}</td>
+        <td class="sub">${pgA ? fmtNum(pgA.gfpg) : '—'}</td>
+        <td class="sub">${pgA ? fmtNum(pgA.gspg) : '—'}</td>
+        <td class="sub">${prior ? fmtNum(prior.gf/prior.g) : '—'}</td>
+        <td class="sub">${prior ? fmtNum(prior.gs/prior.g) : '—'}</td>
+        <td>${spk}</td>
+      </tr>`;
+    }).join('');
+    wrap.innerHTML = `<div class="stats-table-title">Squadre — xG/xGA (fonte del calcolo difficoltà, gol attesi subiti e porta inviolata)</div>
+      <table class="stats-table">
+        <thead><tr>
+          <th>Squadra</th><th>xG tot.</th><th>xGA tot.</th>
+          <th>xG/g blend.</th><th>xGA/g blend.</th>
+          <th>Casa xG/g</th><th>Casa xGA/g</th>
+          <th>Trasf. xG/g</th><th>Trasf. xGA/g</th>
+          <th>St. scorsa GF/g</th><th>St. scorsa GS/g</th>
+          <th>Trend xG/g</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="sub" style="margin-top:4px;">"blend." = xG di quest'anno mescolato con lo storico (shrinkage bayesiano, vedi box "Difficoltà partita" sopra). ${teamXgLastUpdate ? timeAgo(teamXgLastUpdate) : 'mai aggiornato con AI in questa sessione'}.</div>`;
+  }
+
+  function renderAttackStatsTable(){
+    const wrap = $('#attackStatsTableWrap');
+    if(!wrap) return;
+    const players = roster.filter(p=>p.role==='A'||p.role==='C');
+    if(!players.length){ wrap.innerHTML = ''; return; }
+    const rows = players.map(p=>{
+      const stats = PLAYER_XG_STATS[normalizeName(p.name)];
+      const blended = stats ? blendPlayerXg90(stats) : null;
+      const hist = stats && Array.isArray(stats.history) ? stats.history : [];
+      const spk = sparkline(hist.map(h=>h.xg90));
+      return `<tr>
+        <td>${escapeHtml(p.name)}<div class="sub">${escapeHtml(p.team||'')}</div></td>
+        <td>${stats ? fmtNum(stats.xg90) : '—'}</td>
+        <td>${stats ? (stats.minutes||0) : '—'}</td>
+        <td class="sub">${stats && typeof stats.xg90Prev==='number' ? fmtNum(stats.xg90Prev) : '—'}</td>
+        <td class="sub">${stats && stats.minutesPrev ? stats.minutesPrev : '—'}</td>
+        <td><b>${blended!=null ? fmtNum(blended) : '—'}</b></td>
+        <td class="sub">${fmtPct(p.pGolAI)}</td>
+        <td class="sub">${fmtPct(p.pGolStat)}</td>
+        <td><b>${fmtPct(p.pGol)}</b></td>
+        <td>${spk}</td>
+      </tr>`;
+    }).join('');
+    wrap.innerHTML = `<div class="stats-table-title">Attacco (C/A) — xG/90' e probabilità gol</div>
+      <table class="stats-table">
+        <thead><tr>
+          <th>Giocatore</th><th>xG90 corr.</th><th>Min. corr.</th>
+          <th>xG90 st. scorsa</th><th>Min. st. scorsa</th>
+          <th>xG90 blendato</th>
+          <th>P.gol AI</th><th>P.gol xG</th><th>P.gol finale</th>
+          <th>Trend xG90</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="sub" style="margin-top:4px;">"P.gol AI" = giudizio dell'AI (xG, tiri attesi, quote scommesse). "P.gol xG" = calcolato in autonomia (Poisson su xG90 blendato × minuti attesi). "P.gol finale" = media delle due, quella usata nel calcolo del punteggio.</div>`;
+  }
+
+  function renderDefenseStatsTable(){
+    const wrap = $('#defenseStatsTableWrap');
+    if(!wrap) return;
+    const players = roster.filter(p=>p.role==='P'||p.role==='D');
+    if(!players.length){ wrap.innerHTML = ''; return; }
+    const rows = players.map(p=>{
+      const opp = parseOpponentInfo(p.opponent);
+      return `<tr>
+        <td>${escapeHtml(p.name)}<div class="sub">${escapeHtml(p.team||'')}${opp ? ' vs '+escapeHtml(opp.team) : ''}</div></td>
+        <td class="sub">${fmtNum(p.golSubitoAI)}</td>
+        <td class="sub">${fmtNum(p.golSubitoStat)}</td>
+        <td><b>${fmtNum(p.expectedGoalsConceded)}</b></td>
+        <td class="sub">${fmtPct(p.cleanSheetAI)}</td>
+        <td class="sub">${fmtPct(p.cleanSheetStat)}</td>
+        <td><b>${fmtPct(p.cleanSheetProb)}</b></td>
+      </tr>`;
+    }).join('');
+    wrap.innerHTML = `<div class="stats-table-title">Difesa (P/D) — gol attesi subiti e porta inviolata nella prossima partita</div>
+      <table class="stats-table">
+        <thead><tr>
+          <th>Giocatore</th>
+          <th>Gol sub. AI</th><th>Gol sub. xG</th><th>Gol sub. finale</th>
+          <th>Clean sheet AI</th><th>Clean sheet xG</th><th>Clean sheet finale</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="sub" style="margin-top:4px;">"xG" = calcolato in autonomia dal modello di squadra (difesa propria blendata × forza attacco avversario, split casa/trasferta quando disponibile), nessun input AI. "Finale" = media tra AI e xG, quella usata nel calcolo del punteggio.</div>`;
+  }
+
+  function renderStatsTables(){
+    renderTeamStatsTable();
+    renderAttackStatsTable();
+    renderDefenseStatsTable();
+  }
+
   function render(){
     $('#moduleSelect').value = formation.module;
     updateModuleDefWarning();
@@ -2778,6 +3022,7 @@ Rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, senza markdown
     renderPlayerList();
     renderPitch();
     renderHistory();
+    renderStatsTables();
     updateStatusLine();
   }
 
